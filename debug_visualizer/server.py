@@ -527,6 +527,10 @@ HTML_TEMPLATE = """
             align-items: center;
             gap: 10px;
             margin-bottom: 20px;
+            padding: 10px;
+            background: #161b22;
+            border-radius: 6px;
+            border: 1px solid #30363d;
         }
         
         .auto-refresh input[type="checkbox"] {
@@ -536,6 +540,48 @@ HTML_TEMPLATE = """
         .auto-refresh label {
             font-size: 12px;
             cursor: pointer;
+        }
+        
+        .mode-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: auto;
+        }
+        
+        .mode-btn {
+            background: #21262d;
+            color: #8b949e;
+            border: 1px solid #30363d;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        
+        .mode-btn:hover {
+            background: #30363d;
+        }
+        
+        .mode-btn.active {
+            background: #1f6feb;
+            color: white;
+            border-color: #58a6ff;
+        }
+        
+        .mode-indicator {
+            font-size: 10px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            background: #238636;
+            color: white;
+            display: none;
+        }
+        
+        .mode-indicator.visible {
+            display: inline-block;
         }
     </style>
 </head>
@@ -557,7 +603,15 @@ HTML_TEMPLATE = """
             <div class="auto-refresh">
                 <input type="checkbox" id="autoRefresh" checked>
                 <label for="autoRefresh">Auto-refresh (1s)</label>
-                <button class="refresh-btn" onclick="loadCurrentRun()">Refresh Now</button>
+                <button class="refresh-btn" onclick="manualRefresh()">↻ Refresh</button>
+                
+                <div class="mode-toggle">
+                    <span style="font-size: 11px; color: #8b949e;">Mode:</span>
+                    <button class="mode-btn active" id="btnFollowLatest" onclick="setMode('latest')">[LATEST] Follow Latest</button>
+                    <button class="mode-btn" id="btnMonitorRun" onclick="setMode('monitor')">[MONITOR] Monitor Run</button>
+                </div>
+                
+                <span class="mode-indicator visible" id="modeIndicator">[FOLLOWING] Following latest run</span>
             </div>
             
             <!-- Steps Section -->
@@ -576,6 +630,42 @@ HTML_TEMPLATE = """
     
     <script>
         let autoRefreshInterval = null;
+        let currentMode = 'latest'; // 'latest' or 'monitor'
+        let monitoredRunId = null;
+        
+        function setMode(mode) {
+            currentMode = mode;
+            
+            const btnLatest = document.getElementById('btnFollowLatest');
+            const btnMonitor = document.getElementById('btnMonitorRun');
+            const indicator = document.getElementById('modeIndicator');
+            
+            if (mode === 'latest') {
+                btnLatest.classList.add('active');
+                btnMonitor.classList.remove('active');
+                indicator.textContent = '📡 Following latest run';
+                indicator.style.background = '#238636';
+                
+                // If we were monitoring a specific run, switch to latest
+                if (monitoredRunId) {
+                    monitoredRunId = null;
+                    loadCurrentRun();
+                }
+            } else {
+                btnMonitor.classList.add('active');
+                btnLatest.classList.remove('active');
+                
+                // If no run selected yet, use current
+                if (!monitoredRunId || !currentRunId) {
+                    monitoredRunId = currentRunId;
+                }
+                
+                indicator.textContent = `👁️ Monitoring: ${monitoredRunId}`;
+                indicator.style.background = '#1f6feb';
+            }
+            
+            indicator.classList.add('visible');
+        }
         
         async function loadRuns() {
             try {
@@ -588,7 +678,11 @@ HTML_TEMPLATE = """
                 data.runs.forEach(run => {
                     const item = document.createElement('li');
                     item.className = 'run-item';
-                    if (run.run_id === currentRunId) {
+                    
+                    // Highlight active run based on mode
+                    if (currentMode === 'latest' && run.run_id === currentRunId) {
+                        item.classList.add('active');
+                    } else if (currentMode === 'monitor' && run.run_id === monitoredRunId) {
                         item.classList.add('active');
                     }
                     
@@ -598,7 +692,17 @@ HTML_TEMPLATE = """
                         <strong>${run.run_id.substring(0, 15)}</strong><br>
                         <small>${run.status}</small>
                     `;
-                    item.onclick = () => loadRun(run.run_id);
+                    item.onclick = () => {
+                        if (currentMode === 'latest') {
+                            // In latest mode, just view the run without switching modes
+                            loadRun(run.run_id);
+                        } else {
+                            // In monitor mode, switch to monitoring this run
+                            monitoredRunId = run.run_id;
+                            setMode('monitor');
+                            indicator.textContent = `👁️ Monitoring: ${monitoredRunId}`;
+                        }
+                    };
                     runList.appendChild(item);
                 });
             } catch (error) {
@@ -610,6 +714,7 @@ HTML_TEMPLATE = """
         
         async function loadRun(runId) {
             currentRunId = runId;
+            
             try {
                 const response = await fetch(`/api/run/${runId}`);
                 const data = await response.json();
@@ -695,21 +800,46 @@ HTML_TEMPLATE = """
                 const data = await response.json();
                 
                 if (data.run_id) {
-                    loadRun(data.run_id);
+                    // Only auto-switch to latest run in 'latest' mode
+                    if (currentMode === 'latest') {
+                        loadRun(data.run_id);
+                    } else {
+                        // In monitor mode, just update the monitored run
+                        if (monitoredRunId && data.run_id !== monitoredRunId) {
+                            loadRun(monitoredRunId);
+                        }
+                    }
                 }
             } catch (error) {
                 console.error('Error loading current run:', error);
             }
         }
         
-        // Initial load
+        async function manualRefresh() {
+            if (currentMode === 'latest') {
+                await loadCurrentRun();
+            } else {
+                await loadRun(monitoredRunId);
+            }
+        }
+        
+        // Initial load - start in latest mode
         loadCurrentRun();
         
-        // Auto-refresh
+        // Auto-refresh handler
         document.getElementById('autoRefresh').addEventListener('change', (e) => {
             if (e.target.checked) {
                 if (!autoRefreshInterval) {
-                    autoRefreshInterval = setInterval(loadCurrentRun, 1000);
+                    autoRefreshInterval = setInterval(() => {
+                        if (currentMode === 'latest') {
+                            loadCurrentRun();
+                        } else {
+                            // In monitor mode, refresh the monitored run
+                            if (monitoredRunId) {
+                                loadRun(monitoredRunId);
+                            }
+                        }
+                    }, 1000);
                 }
             } else {
                 if (autoRefreshInterval) {
@@ -719,7 +849,7 @@ HTML_TEMPLATE = """
             }
         });
         
-        // Start auto-refresh
+        // Start auto-refresh in latest mode by default
         autoRefreshInterval = setInterval(loadCurrentRun, 1000);
     </script>
 </body>
