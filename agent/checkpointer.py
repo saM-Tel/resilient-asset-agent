@@ -79,6 +79,29 @@ class Checkpointer:
         
         self.conn.commit()
     
+    def clear_run(self, run_id: str) -> None:
+        """
+        Clear all data for a specific run_id.
+        
+        Called when re-running with the same ID to give a clean slate.
+        Removes steps and decisions but keeps the run record.
+        """
+        cursor = self.conn.cursor()
+        
+        # Delete all steps for this run
+        cursor.execute("DELETE FROM steps WHERE run_id = ?", (run_id,))
+        
+        # Delete all decisions for this run
+        cursor.execute("DELETE FROM decisions WHERE run_id = ?", (run_id,))
+        
+        # Reset run status to IN_PROGRESS with new timestamp
+        cursor.execute(
+            "UPDATE runs SET status = 'IN_PROGRESS', created_at = ?, completed_at = NULL WHERE run_id = ?",
+            (time.time(), run_id)
+        )
+        
+        self.conn.commit()
+    
     def create_run(self, run_id: str) -> None:
         """Create a new execution run."""
         cursor = self.conn.cursor()

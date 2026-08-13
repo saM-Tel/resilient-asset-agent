@@ -320,6 +320,12 @@ Decide next action. Return JSON only."""
         print(f"Starting Asset Sync Agent - Run ID: {self.run_id}")
         print(f"{'='*60}\n")
         
+        # Clear previous run data if this run_id already exists (clean slate for re-runs)
+        existing_run = self.checkpointer.get_run_status(self.run_id)
+        if existing_run:
+            print(f"[INFO] Re-running with existing ID '{self.run_id}' - clearing previous data")
+            self.checkpointer.clear_run(self.run_id)
+        
         while iteration < MAX_ITERATIONS:
             iteration += 1
             print(f"\n--- Iteration {iteration} ---\n")
