@@ -181,7 +181,7 @@ Decide next action. Return JSON only."""
         
         # Handle empty response
         if not content:
-            print("⚠️ LLM returned empty response, requesting asset fetch")
+            print("[WARN] LLM returned empty response, requesting asset fetch")
             return {
                 "action": "fetch_location",
                 "reasoning": "Empty response from LLM, starting with location fetch",
@@ -204,8 +204,8 @@ Decide next action. Return JSON only."""
         try:
             return json.loads(content)
         except json.JSONDecodeError as e:
-            print(f"⚠️ Failed to parse JSON: {e}")
-            print(f"⚠️ Response content: {content[:100]}...")
+            print(f"[WARN] Failed to parse JSON: {e}")
+            print(f"[WARN] Response content: {content[:100]}...")
             # Fallback to fetch_location on parse failure
             return {
                 "action": "fetch_location",
@@ -309,13 +309,6 @@ Decide next action. Return JSON only."""
         """
         Main execution loop - runs until all steps complete or max iterations reached.
         
-        The loop:
-        1. Gets current execution context
-        2. Prompts LLM to decide next action
-        3. Executes the chosen action
-        4. Logs the decision and result
-        5. Repeats until DONE or max iterations
-        
         Returns:
             Dictionary with final execution summary
         """
@@ -339,7 +332,7 @@ Decide next action. Return JSON only."""
             required_steps = {"fetch_location", "validate_consistency", "write_db_correction", "update_cache"}
             
             if required_steps.issubset(completed_step_names):
-                print("✅ All required steps completed! Auto-completing workflow.")
+                print("[OK] All required steps completed! Auto-completing workflow.")
                 self.checkpointer.complete_run(self.run_id)
                 return {
                     "status": "COMPLETED",
@@ -365,11 +358,11 @@ Decide next action. Return JSON only."""
                     print(f"LLM Response:\n{response_content}\n")
                 else:
                     empty_responses += 1
-                    print("⚠️ LLM returned empty response\n")
+                    print("[WARN] LLM returned empty response\n")
                     
                     # If too many empty responses, force progress with a default action
                     if empty_responses >= 2:
-                        print("⚠️ Forcing progress after empty responses...")
+                        print("[WARN] Forcing progress after empty responses...")
                         # Determine sensible next step based on what's completed
                         if not context["completed_steps"]:
                             response_content = '{"action": "fetch_location", "reasoning": "First step: fetch location", "parameters": {"asset_id": "asset_001"}}'
@@ -400,7 +393,7 @@ Decide next action. Return JSON only."""
                 
                 # Execute the action
                 if action == "DONE":
-                    print("✅ All steps completed successfully!")
+                    print("[OK] All steps completed successfully!")
                     self.checkpointer.complete_run(self.run_id)
                     
                     return {
@@ -412,11 +405,11 @@ Decide next action. Return JSON only."""
                 success, result = self.execute_action(action, parameters)
                 
                 if not success:
-                    print(f"⚠️ Action failed: {result.get('error', 'Unknown error')}")
+                    print(f"[WARN] Action failed: {result.get('error', 'Unknown error')}")
                     
                     # If we keep failing the same action, try recovery
                     if iteration >= MAX_ITERATIONS - 1:
-                        print("⚠️ Approaching max iterations - marking run as FAILED")
+                        print("[WARN] Approaching max iterations - marking run as FAILED")
                         self.checkpointer.fail_run(self.run_id, "Max iterations reached")
                         return {
                             "status": "FAILED",
@@ -425,7 +418,7 @@ Decide next action. Return JSON only."""
                         }
                 
             except Exception as e:
-                print(f"❌ Error in execution loop: {e}")
+                print(f"[ERROR] Error in execution loop: {e}")
                 self.checkpointer.fail_run(self.run_id, str(e))
                 return {
                     "status": "ERROR",
@@ -434,7 +427,7 @@ Decide next action. Return JSON only."""
                 }
         
         # Max iterations reached
-        print(f"\n⚠️ Reached max iterations ({MAX_ITERATIONS})")
+        print(f"\n[WARN] Reached max iterations ({MAX_ITERATIONS})")
         self.checkpointer.fail_run(self.run_id, "Max iterations exceeded")
         return {
             "status": "FAILED",

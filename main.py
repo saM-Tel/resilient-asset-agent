@@ -46,19 +46,19 @@ def configure_failure_injection(args: argparse.Namespace) -> None:
     
     if args.fail_at == "cache_update":
         ServiceConfig.cache_timeout = True
-        print("⚠️  FAILURE INJECTION: Cache service will timeout")
+        print("[WARN] FAILURE INJECTION: Cache service will timeout")
     
     elif args.fail_at == "location_service":
         ServiceConfig.inject_timeout = True
-        print("⚠️  FAILURE INJECTION: Location service will timeout")
+        print("[WARN] FAILURE INJECTION: Location service will timeout")
     
     if args.inject_stale:
         ServiceConfig.inject_stale_data = True
-        print("⚠️  FAILURE INJECTION: Location service will return stale data")
+        print("[WARN] FAILURE INJECTION: Location service will return stale data")
     
     if args.partial_write:
         ServiceConfig.partial_write = True
-        print("⚠️  FAILURE INJECTION: Database will perform partial write")
+        print("[WARN] FAILURE INJECTION: Database will perform partial write")
 
 
 def main():
