@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Database & Checkpoint logs
+*.db
+*.sqlite3
+checkpoint_*.json
+
+# VS Code
+.vscode/
