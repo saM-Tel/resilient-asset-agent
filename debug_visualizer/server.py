@@ -728,6 +728,14 @@ HTML_TEMPLATE = """
                 document.getElementById('pageTitle').textContent = `Run: ${data.run_id}`;
                 
                 const runMeta = data.run_info;
+                
+                // Deduplicate steps for accurate count (keep only latest execution of each step)
+                const uniqueStepMap = new Map();
+                data.steps.forEach(step => {
+                    uniqueStepMap.set(step.step_name, step);
+                });
+                const uniqueSteps = Array.from(uniqueStepMap.values());
+                
                 const metaHtml = `
                     <div class="run-meta">
                         <div class="meta-item">
@@ -736,7 +744,7 @@ HTML_TEMPLATE = """
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">Steps Completed</div>
-                            <div class="meta-value">${data.steps.filter(s => s.status === 'COMPLETED').length}/${data.steps.length}</div>
+                            <div class="meta-value">${uniqueSteps.filter(s => s.status === 'COMPLETED').length}/${uniqueSteps.length}</div>
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">Created</div>
@@ -746,12 +754,20 @@ HTML_TEMPLATE = """
                 `;
                 document.getElementById('runInfo').innerHTML = metaHtml;
                 
-                // Render steps
+                // Render steps - deduplicate by keeping only the latest execution of each step
                 const stepsContainer = document.getElementById('stepsContainer');
                 if (data.steps.length === 0) {
                     stepsContainer.innerHTML = '<div class="loading">No steps recorded yet</div>';
                 } else {
-                    stepsContainer.innerHTML = data.steps.map(step => `
+                    // Group steps by name, keep only the last occurrence of each
+                    const stepMap = new Map();
+                    data.steps.forEach(step => {
+                        stepMap.set(step.step_name, step);
+                    });
+                    
+                    const uniqueSteps = Array.from(stepMap.values());
+                    
+                    stepsContainer.innerHTML = uniqueSteps.map((step, index) => `
                         <div class="step ${(step.status || 'pending').toLowerCase()}">
                             <div class="step-header">
                                 <div>
@@ -775,16 +791,22 @@ HTML_TEMPLATE = """
                 if (data.decisions.length === 0) {
                     decisionsContainer.innerHTML = '<div class="loading">No decisions recorded yet</div>';
                 } else {
-                    decisionsContainer.innerHTML = data.decisions.map(decision => `
-                        <div class="decision">
-                            <div class="decision-header">Iteration ${decision.step_name.split('_').pop()}</div>
-                            <div>
-                                <span class="decision-action">${decision.next_action}</span>
-                                <span class="step-time">${new Date(decision.created_at).toLocaleTimeString()}</span>
+                    decisionsContainer.innerHTML = data.decisions.map(decision => {
+                        const cycleNum = decision.step_name.split('_').pop();
+                        // Handle both 'timestamp' (actual column) and 'created_at' (fallback)
+                        const timeStr = decision.timestamp ? new Date(decision.timestamp * 1000).toLocaleTimeString() : 
+                                       (decision.created_at ? new Date(decision.created_at * 1000).toLocaleTimeString() : '');
+                        return `
+                            <div class="decision">
+                                <div class="decision-header">Iteration ${cycleNum}</div>
+                                <div>
+                                    <span class="decision-action">${decision.next_action}</span>
+                                    <span class="step-time">${timeStr}</span>
+                                </div>
+                                ${decision.reasoning ? `<div class="decision-reasoning"><strong>Reasoning:</strong> ${decision.reasoning}</div>` : ''}
                             </div>
-                            ${decision.reasoning ? `<div class="decision-reasoning"><strong>Reasoning:</strong> ${decision.reasoning}</div>` : ''}
-                        </div>
-                    `).join('');
+                        `;
+                    }).join('');
                 }
                 
                 loadRuns();
