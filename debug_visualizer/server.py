@@ -39,65 +39,156 @@ def get_run_data(run_id: str = None) -> dict:
     try:
         # Get most recent run if not specified
         if not run_id:
-            cursor.execute("SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1")
+            cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 1")
             result = cursor.fetchone()
             run_id = result[0] if result else None
         
         if not run_id:
-            return {"error": "No runs found"}
+            return {
+                "error": "No runs found",
+                "debug": "Database is empty or no steps recorded",
+                "run_id": None,
+                "run_info": {},
+                "steps": [],
+                "decisions": [],
+                "all_runs": []
+            }
         
-        # Get run info
+        # Get run info from runs table
         cursor.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,))
-        run_info = dict(cursor.fetchone()) if cursor.fetchone() else {}
-        cursor.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,))
-        run_info = dict(cursor.fetchone()) if cursor.fetchone() else {}
+        run_row = cursor.fetchone()
+        run_info = dict(run_row) if run_row else {"run_id": run_id, "status": "UNKNOWN", "created_at": None}
         
         # Get steps
         cursor.execute(
-            "SELECT * FROM steps WHERE run_id = ? ORDER BY created_at ASC",
+            "SELECT id, run_id, step_name, step_order, status, input_data, output_data, error_message, started_at, completed_at FROM steps WHERE run_id = ? ORDER BY id ASC",
             (run_id,)
         )
-        steps = [dict(row) for row in cursor.fetchall()]
+        steps = []
+        for row in cursor.fetchall():
+            step = {
+                "id": row[0],
+                "run_id": row[1],
+                "step_name": row[2],
+                "step_order": row[3],
+                "status": row[4],
+                "input_data": row[5],
+                "output_data": row[6],
+                "error": row[7],
+                "created_at": row[8],
+                "updated_at": row[9]
+            }
+            
+            # Parse JSON fields
+            for key in ["input_data", "output_data"]:
+                if step.get(key):
+                    try:
+                        step[key] = json.loads(step[key])
+                    except:
+                        pass
+            
+            steps.append(step)
         
         # Get decisions
         cursor.execute(
-            "SELECT * FROM decisions WHERE run_id = ? ORDER BY created_at ASC",
+            "SELECT * FROM decisions WHERE run_id = ? ORDER BY id ASC",
             (run_id,)
         )
-        decisions = [dict(row) for row in cursor.fetchall()]
-        
-        # Parse JSON fields
-        for step in steps:
-            if step.get("output_data"):
-                try:
-                    step["output_data"] = json.loads(step["output_data"])
-                except:
-                    pass
-            if step.get("error"):
-                try:
-                    step["error"] = json.loads(step["error"])
-                except:
-                    pass
-        
-        for decision in decisions:
-            if decision.get("reasoning"):
-                try:
-                    decision["reasoning"] = json.loads(decision["reasoning"])
-                except:
-                    pass
+        decisions = []
+        for row in cursor.fetchall():
+            decision = {
+                "id": row[0],
+                "run_id": row[1],
+                "step_name": row[2],
+                "reasoning": row[3],
+                "next_action": row[4],
+                "timestamp": row[5]
+            }
+            decisions.append(decision)
         
         # Get all runs for sidebar
-        cursor.execute("SELECT run_id, status, created_at FROM runs ORDER BY created_at DESC LIMIT 10")
-        all_runs = [dict(row) for row in cursor.fetchall()]
+        cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 20")
+        all_runs = []
+        for row in cursor.fetchall():
+            run_id_item = row[0]
+            cursor.execute("SELECT status FROM runs WHERE run_id = ? LIMIT 1", (run_id_item,))
+            status_row = cursor.fetchone()
+            status = status_row[0] if status_row else "UNKNOWN"
+            
+            cursor.execute("SELECT MAX(started_at) FROM steps WHERE run_id = ?", (run_id_item,))
+            created_row = cursor.fetchone()
+            created_at = created_row[0] if created_row else None
+            
+            all_runs.append({
+                "run_id": run_id_item,
+                "status": status,
+                "created_at": created_at
+            })
         
         return {
             "run_id": run_id,
             "run_info": run_info,
             "steps": steps,
             "decisions": decisions,
-            "all_runs": all_runs
+            "all_runs": all_runs,
+            "debug": f"Loaded {len(steps)} steps and {len(decisions)} decisions"
         }
     
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "debug": traceback.format_exc(),
+            "run_id": run_id,
+            "run_info": {},
+            "steps": [],
+            "decisions": [],
+            "all_runs": []
+        }
+    
+    finally:
+        conn.close()
+
+
+@app.route("/api/debug")
+def api_debug():
+    """Get debug information about database state."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Get database statistics
+        cursor.execute("SELECT COUNT(*) FROM runs")
+        total_runs = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM steps")
+        total_steps = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM decisions")
+        total_decisions = cursor.fetchone()[0]
+        
+        # Get recent runs with counts
+        cursor.execute("""
+            SELECT run_id, status, 
+                   (SELECT COUNT(*) FROM steps WHERE run_id = runs.run_id) as step_count,
+                   (SELECT COUNT(*) FROM decisions WHERE run_id = runs.run_id) as decision_count
+            FROM runs 
+            ORDER BY created_at DESC 
+            LIMIT 10
+        """)
+        recent_runs = [dict(zip(['run_id', 'status', 'step_count', 'decision_count'], row)) 
+                      for row in cursor.fetchall()]
+        
+        return jsonify({
+            "status": "ok",
+            "total_runs": total_runs,
+            "total_steps": total_steps,
+            "total_decisions": total_decisions,
+            "recent_runs": recent_runs,
+            "db_path": str(DB_PATH)
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)})
     finally:
         conn.close()
 
@@ -114,11 +205,26 @@ def api_runs():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    cursor.execute("SELECT run_id, status, created_at FROM runs ORDER BY created_at DESC LIMIT 20")
-    runs = [dict(row) for row in cursor.fetchall()]
-    
-    conn.close()
-    return jsonify({"runs": runs})
+    try:
+        cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 20")
+        runs = []
+        for row in cursor.fetchall():
+            run_id = row[0]
+            cursor.execute("SELECT status FROM runs WHERE run_id = ? LIMIT 1", (run_id,))
+            status_row = cursor.fetchone()
+            status = status_row[0] if status_row else "UNKNOWN"
+            
+            cursor.execute("SELECT MAX(started_at) FROM steps WHERE run_id = ?", (run_id,))
+            created_row = cursor.fetchone()
+            created_at = created_row[0] if created_row else None
+            
+            runs.append({"run_id": run_id, "status": status, "created_at": created_at})
+        
+        return jsonify({"runs": runs})
+    except Exception as e:
+        return jsonify({"runs": [], "error": str(e)})
+    finally:
+        conn.close()
 
 
 @app.route("/api/run/<run_id>")
