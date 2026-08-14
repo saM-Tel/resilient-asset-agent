@@ -106,6 +106,42 @@ cd debug_visualizer
 
 Open `http://localhost:5000` in your browser. Use the mode toggle to switch between [LATEST] Follow Latest (auto-refreshes newest run) and [MONITOR] Monitor Run (stays on selected run).
 
+## Testing
+
+Automated pytest suite that verifies recovery, idempotency, and state persistence deterministically — no live LLM required.
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
+**Current coverage (7 tests):**
+
+| Test | Verifies |
+|------|----------|
+| `test_idempotency_guard_prevents_duplicate_writes` | Completed sub-task recorded once, retrievable with `tx_id` |
+| `test_step_idempotency_returns_cached_result` | Completed step is retrievable so the runner can skip re-execution |
+| `test_network_timeout_records_unknown_and_reconciles` | Timeout logged as `UNKNOWN` sub-task + audit event |
+| `test_event_log_is_append_only_and_ordered` | Events appended chronologically, never mutated |
+| `test_health_check_detects_service_down` | Health probe reflects injected cache failure |
+| `test_health_check_all_healthy_by_default` | All services report healthy with no failures injected |
+| `test_health_check_detects_location_unavailable` | Health probe reflects unavailable location service |
+
+## CI Pipeline
+
+GitHub Actions runs the full pytest suite on every push/PR to `main` (Python 3.12, Ubuntu). See `.github/workflows/ci.yml`.
+
+## Docker
+
+One-command containerized startup:
+
+```bash
+docker compose up --build
+```
+
+- `Dockerfile` — `python:3.12-slim`, installs deps, runs `main.py`
+- `docker-compose.yml` — mounts `./data` for persistent state, wires `LLM_BASE_URL` to the host's local `llama-server` via `host.docker.internal`
+
 ## Failure Recovery Demo
 
 ### Scenario: Cache Timeout After DB Write
@@ -198,8 +234,16 @@ resilient-asset-agent/
 │   ├── requirements.txt   # Flask dependencies
 │   ├── run.bat / run.ps1  # Launchers
 │   └── README.md          # Visualizer docs
+├── tests/
+│   └── test_resilience.py # Automated pytest suite (idempotency, recovery, health)
+├── .github/
+│   └── workflows/
+│       └── ci.yml         # GitHub Actions CI (runs pytest on push/PR to main)
 ├── .gitignore
+├── conftest.py            # Root pytest config (puts repo root on sys.path for CI)
 ├── requirements.txt
+├── Dockerfile             # python:3.12-slim container image
+├── docker-compose.yml     # One-command startup (mounts ./data, wires LLM URL)
 ├── main.py                # Main CLI runner (with failure injection flags)
 ├── test_edge_cases.py     # Edge-case verification suite
 └── README.md              # This file
@@ -237,6 +281,7 @@ MIT
 - **Phase 3**: Debug & Refinement — 6 bugs fixed (see above)
 - **Phase 4**: Testing & Validation — normal workflow, failure recovery, idempotency verified
 - **Phase 5**: Documentation & Visualizer — README, debug dashboard
+- **Phase 6**: CI & Deployment — pytest resilience suite, GitHub Actions CI, Docker setup, README badges
 
 ### Lessons Learned
 
