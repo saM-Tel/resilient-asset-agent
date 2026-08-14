@@ -49,11 +49,11 @@ graph TD
 - Evaluates current state to decide next action
 - Handles max iterations and recovery logic
 
-## Quickstart
+## How to Run It
 
 ### Prerequisites
 - Python 3.10+
-- Local LLM server running on `localhost:8000` (e.g., `llama-server.exe`, LM Studio, vLLM)
+- Local LLM server running on `localhost:8000` (e.g., `llama-server.exe`, LM Studio, vLLM) with model `qwen3.6-35b`
 
 ### Installation
 
@@ -71,23 +71,29 @@ pip install -r requirements.txt
 
 **Normal execution (no failures):**
 ```bash
-python main.py --run-id test-001
+python main.py --run-id video-demo
 ```
 
-**Simulate cache timeout after DB write:**
+**Simulate cache timeout (demonstrates intelligent failure recovery):**
 ```bash
-python main.py --run-id demo-failure --fail-at cache_update
+python main.py --run-id video-demo --fail-at cache_update
 ```
 
-**Simulate stale location data:**
-```bash
-python main.py --run-id demo-stale --inject-stale
-```
-
-**Combine failure injections:**
+**Combine multiple failure injections:**
 ```bash
 python main.py --run-id complex-scenario --fail-at cache_update --partial-write
 ```
+
+### Debug Visualizer
+
+Monitor agent execution in real-time via web dashboard:
+
+```bash
+cd debug_visualizer
+.\run.bat  # or python server.py
+```
+
+Open `http://localhost:5000` in your browser. Use the mode toggle to switch between [LATEST] Follow Latest (auto-refreshes newest run) and [MONITOR] Monitor Run (stays on selected run).
 
 ## Failure Recovery Demo
 
@@ -100,12 +106,13 @@ This demonstrates the core assessment requirement: **intelligent recovery withou
 
 ## What I Would Do With More Time
 
-1. **Distributed Locking**: Implement mutex/lock mechanisms to prevent race conditions in multi-agent scenarios
-2. **Saga Pattern**: Add compensation actions (rollback steps) for true saga orchestration
-3. **Vector State Logging**: Use embeddings for semantic search of execution history
-4. **Retry with Backoff**: Implement exponential backoff for transient failures
-5. **Health Check Dashboard**: Real-time monitoring of service health and agent status
-6. **Configuration Profiles**: YAML-based failure scenarios for reproducible testing
+1. **Distributed Locking (Redis/mutex)**: Prevent race conditions during concurrent agent executions by implementing a distributed lock manager that ensures only one agent can modify the same asset at a time.
+
+2. **Saga Compensating Transactions**: If cache recovery permanently fails, roll back the DB write with a compensating transaction to maintain data consistency across services — ensuring atomicity even when partial failures occur.
+
+3. **Streaming LLM Reasoning to CLI/UI**: Stream LLM reasoning tokens directly to the terminal and debug visualizer for lower-latency feedback, so users can see the agent "thinking" in real-time rather than waiting for full responses.
+
+4. **Adaptive Retry with Exponential Backoff**: Replace fixed retry limits with intelligent backoff strategies that increase wait times between retries based on service health trends and historical recovery patterns.
 
 ## Project Structure
 

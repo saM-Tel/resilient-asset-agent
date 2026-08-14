@@ -45,6 +45,10 @@ class AssetSyncAgent:
         self.checkpointer = checkpointer
         self.run_id = run_id
         
+        # Recovery state tracking (persists across iterations)
+        self._force_health_check = False
+        self._last_health_results = None
+        
         # Define available tools and their descriptions for the LLM
         self.tools = {
             "fetch_location": {
@@ -102,6 +106,14 @@ class AssetSyncAgent:
                     },
                     "required": ["cache_data"]
                 }
+            },
+            "check_system_health": {
+                "name": "check_system_health",
+                "description": "Check health status of all distributed services (location, database, cache). Use this when a step fails to diagnose which service is down before deciding next action.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
             }
         }
     
@@ -145,12 +157,22 @@ class AssetSyncAgent:
 3. write_db_correction - write to database
 4. update_cache - update cache
 
+ADDITIONAL TOOL:
+- check_system_health - diagnose service status when steps fail
+
+FAILURE HANDLING RULES:
+- If ANY step fails, DO NOT retry it immediately. Your next action MUST be check_system_health.
+- CRITICAL HEALTH CHECK RULE: After calling check_system_health, if the returned health status shows a service is False/DOWN (e.g., {"cache": false}):
+  - DO NOT call 'check_system_health' again.
+  - DO NOT retry the failed step.
+  - You MUST output action "halt" with reasoning explaining: "[Service] service is reported as DOWN by health check. Pausing workflow until service recovers."
+- Only retry a failed step after health check confirms ALL services are HEALTHY (True).
+
 RULES:
 - Never repeat completed steps
 - Return ONLY valid JSON: {"action": "...", "reasoning": "...", "parameters": {...}}
 - Use "DONE" when all steps complete
-- Be brief and respond immediately
-- If unsure, choose fetch_location"""
+- Be brief and respond immediately"""
         
         # Build execution history summary (brief format)
         completed_names = [s["step_name"] for s in context["completed_steps"]]
@@ -160,6 +182,18 @@ RULES:
 Failed: {failed_names}
 
 Decide next action. Return JSON only."""
+        
+        # If force_health_check is set, add explicit instruction
+        if self._force_health_check:
+            user_message += "\n\n[IMPORTANT] A step just failed. Your next action MUST be check_system_health to diagnose service status."
+        
+        # If we have health check results from a previous iteration, inject them so LLM can act on them
+        if self._last_health_results is not None:
+            health = self._last_health_results
+            down_services = [svc for svc, healthy in health.items() if not healthy]
+            user_message += f"\n\n[HEALTH CHECK RESULTS] {health}"
+            if down_services:
+                user_message += f"\n[CRITICAL] Services DOWN: {', '.join(down_services)}. Per failure handling rules, you MUST output action 'halt' - do NOT call check_system_health again."
         
         return [
             {"role": "system", "content": system_prompt},
@@ -241,13 +275,14 @@ Decide next action. Return JSON only."""
             "parameters": {"asset_id": "asset_001"}
         }
     
-    def execute_action(self, action: str, parameters: dict = None) -> tuple[bool, dict]:
+    def execute_action(self, action: str, parameters: dict = None, reasoning: str = "") -> tuple[bool, dict]:
         """
         Execute the LLM's chosen action through the appropriate tool.
         
         Args:
             action: Tool name to execute
             parameters: Parameters for the tool call
+            reasoning: Optional reasoning from the LLM (used for halt/stop actions)
             
         Returns:
             Tuple of (success: bool, result: dict)
@@ -330,6 +365,20 @@ Decide next action. Return JSON only."""
             result = execute_update_cache(self.checkpointer, self.run_id, cache_data)
             return result.success, result.to_dict()
         
+        elif action == "check_system_health":
+            from stubs.services import check_service_health
+            health = check_service_health()
+            print(f"  [OK] check_system_health: {health}")
+            # Store results in instance variable so LLM sees them next iteration
+            self._last_health_results = health
+            return True, {"health_status": health}
+        
+        elif action in ["halt", "stop"]:
+            # Agent has decided to halt due to service unavailability
+            print(f"[INFO] Workflow halted by agent: {reasoning}")
+            self.checkpointer.complete_run(self.run_id)  # Mark as completed (intelligently halted)
+            return True, {"message": f"Workflow halted - {reasoning}"}
+        
         else:
             return False, {"error": f"Unknown action: {action}"}
     
@@ -340,9 +389,10 @@ Decide next action. Return JSON only."""
         Returns:
             Dictionary with final execution summary
         """
-        MAX_ITERATIONS = 10
+        MAX_ITERATIONS = 15
         iteration = 0
         empty_responses = 0  # Track consecutive empty responses
+        last_failed_action = None  # Track the most recent failed action for intelligent recovery
         
         print(f"\n{'='*60}")
         print(f"Starting Asset Sync Agent - Run ID: {self.run_id}")
@@ -377,6 +427,43 @@ Decide next action. Return JSON only."""
                     "iterations": iteration,
                     "summary": "Asset synchronization completed (auto-detected)"
                 }
+            
+            # INTELLIGENT RECOVERY: If a step just failed, force check_system_health
+            if self._force_health_check:
+                print("[INFO] Step failed - forcing intelligent recovery via health check\n")
+                
+                # Execute health check directly (no LLM needed)
+                from stubs.services import check_service_health
+                health = check_service_health()
+                print(f"  [OK] check_system_health: {health}")
+                
+                # Log the decision
+                self.checkpointer.save_decision(
+                    run_id=self.run_id,
+                    step_name=f"iteration_{iteration}",
+                    reasoning=f"{last_failed_action} failed. Calling health check to diagnose.",
+                    next_action="check_system_health"
+                )
+                
+                # Store health results in instance variable so LLM can see them next iteration
+                self._last_health_results = health
+                
+                # If any service is DOWN, halt immediately - no need for LLM
+                down_services = [svc for svc, healthy in health.items() if not healthy]
+                if down_services:
+                    print(f"[INFO] Services DOWN: {', '.join(down_services)}")
+                    print(f"[INFO] Workflow halted by agent - service recovery required\n")
+                    self.checkpointer.complete_run(self.run_id)
+                    return {
+                        "status": "COMPLETED",  # Intelligently halted, not failed
+                        "iterations": iteration,
+                        "summary": f"Workflow halted - services unavailable: {', '.join(down_services)}"
+                    }
+                
+                # All services healthy - clear flag and continue to next iteration
+                self._force_health_check = False
+                last_failed_action = None
+                continue
             
             # Build and send prompt to LLM
             messages = self.build_llm_prompt(context)
@@ -440,12 +527,18 @@ Decide next action. Return JSON only."""
                         "summary": "Asset synchronization completed"
                     }
                 
-                success, result = self.execute_action(action, parameters)
+                success, result = self.execute_action(action, parameters, reasoning)
                 
                 if not success:
-                    print(f"[WARN] Action failed: {result.get('error', 'Unknown error')}")
+                    print(f"[FAIL] {action}: {result.get('error', 'Unknown error')}")
                     
-                    # If we keep failing the same action, try recovery
+                    # Track the failed action for intelligent recovery
+                    last_failed_action = action
+                    
+                    # Force check_system_health on next iteration instead of blind retry
+                    self._force_health_check = True
+                    
+                    # If we keep failing the same action after health check, mark as FAILED
                     if iteration >= MAX_ITERATIONS - 1:
                         print("[WARN] Approaching max iterations - marking run as FAILED")
                         self.checkpointer.fail_run(self.run_id, "Max iterations reached")
