@@ -1,5 +1,9 @@
 # Resilient Asset Agent
 
+[![CI Test Suite](https://github.com/saM-Tel/resilient-asset-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/saM-Tel/resilient-asset-agent/actions)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A fault-tolerant AI agent that synchronizes asset state across distributed services with intelligent failure recovery.
 
 ## Overview

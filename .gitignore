@@ -9,5 +9,11 @@ __pycache__/
 *.sqlite3
 checkpoint_*.json
 
+# Docker runtime data (docker-compose volume)
+data/
+
+# Test artifacts
+.pytest_cache/
+
 # VS Code
 .vscode/

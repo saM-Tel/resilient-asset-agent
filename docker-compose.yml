@@ -1,0 +1,8 @@
+services:
+  agent:
+    build: .
+    volumes:
+      - ./data:/app/data
+    command: ["python", "main.py", "--run-id", "docker-demo", "--llm-url", "http://host.docker.internal:8000/v1"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
