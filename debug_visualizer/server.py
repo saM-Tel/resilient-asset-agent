@@ -700,7 +700,7 @@ HTML_TEMPLATE = """
                             // In monitor mode, switch to monitoring this run
                             monitoredRunId = run.run_id;
                             setMode('monitor');
-                            indicator.textContent = `👁️ Monitoring: ${monitoredRunId}`;
+                            document.getElementById('modeIndicator').textContent = `👁️ Monitoring: ${monitoredRunId}`;
                         }
                     };
                     runList.appendChild(item);

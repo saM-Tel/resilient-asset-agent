@@ -166,12 +166,13 @@ Decide next action. Return JSON only."""
             {"role": "user", "content": user_message}
         ]
     
-    def parse_llm_response(self, response_content: str) -> dict:
+    def parse_llm_response(self, response_content: str, context: dict = None) -> dict:
         """
         Parse the LLM's JSON response into a decision.
         
         Args:
             response_content: Raw text from LLM response
+            context: Optional execution context for smarter fallback
             
         Returns:
             Dictionary with action, reasoning, and parameters
@@ -181,37 +182,64 @@ Decide next action. Return JSON only."""
         
         # Handle empty response
         if not content:
-            print("[WARN] LLM returned empty response, requesting asset fetch")
+            print("[WARN] LLM returned empty response")
             return {
                 "action": "fetch_location",
                 "reasoning": "Empty response from LLM, starting with location fetch",
                 "parameters": {"asset_id": "asset_001"}
             }
         
-        # Try to extract JSON from response (handle markdown code blocks)
-        if "```" in content:
-            # Extract JSON from code block (handles ```json, ```python, etc.)
-            start = content.find("```") + 3
-            # Skip language identifier (e.g., "json", "python")
-            first_line_end = content.find("\n", start)
-            if first_line_end != -1:
-                start = first_line_end + 1
-            
-            end = content.rfind("```")
-            content = content[start:end].strip()
+        # Try to extract JSON from markdown code blocks if present
+        if content.startswith("```"):
+            # Find the closing backticks
+            end = content.find("```", 3)
+            if end != -1:
+                # Extract everything between opening and closing markers
+                inner = content[3:end].strip()
+                # Skip language identifier line (e.g., "json" or "python")
+                first_newline = inner.find("\n")
+                if first_newline != -1:
+                    content = inner[first_newline + 1:].strip()
+                else:
+                    content = inner
         
-        # Try to parse JSON
+        # Try to parse JSON directly
         try:
-            return json.loads(content)
+            parsed = json.loads(content)
+            # Validate it has at least an action field
+            if isinstance(parsed, dict) and "action" in parsed:
+                return parsed
         except json.JSONDecodeError as e:
             print(f"[WARN] Failed to parse JSON: {e}")
-            print(f"[WARN] Response content: {content[:100]}...")
-            # Fallback to fetch_location on parse failure
-            return {
-                "action": "fetch_location",
-                "reasoning": f"Failed to parse LLM response: {str(e)}",
-                "parameters": {"asset_id": "asset_001"}
-            }
+        
+        # If parsing failed, try to find a JSON object within the response
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            json_str = content[start:end + 1]
+            try:
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict) and "action" in parsed:
+                    return parsed
+            except json.JSONDecodeError as e2:
+                print(f"[WARN] Extracted JSON also failed to parse: {e2}")
+        
+        # Ultimate fallback - pick a better default based on what's already completed
+        if context:
+            completed_names = [s["step_name"] for s in context.get("completed_steps", [])]
+            if "update_cache" not in completed_names and "write_db_correction" not in completed_names:
+                return {"action": "fetch_location", "reasoning": "Parse failed, starting fresh", "parameters": {"asset_id": "asset_001"}}
+            elif "validate_consistency" not in completed_names:
+                return {"action": "validate_consistency", "reasoning": "Parse failed, next step is validation", "parameters": {}}
+            elif "write_db_correction" not in completed_names:
+                return {"action": "write_db_correction", "reasoning": "Parse failed, next step is DB write", "parameters": {}}
+        
+        # Absolute fallback
+        return {
+            "action": "fetch_location",
+            "reasoning": f"Failed to parse LLM response: {str(e) if 'e' in dir() else 'unknown'}",
+            "parameters": {"asset_id": "asset_001"}
+        }
     
     def execute_action(self, action: str, parameters: dict = None) -> tuple[bool, dict]:
         """
@@ -380,8 +408,8 @@ Decide next action. Return JSON only."""
                             response_content = '{"action": "update_cache", "reasoning": "Final step: update cache", "parameters": {}}'
                         empty_responses = 0
                 
-                # Parse decision
-                decision = self.parse_llm_response(response_content)
+                # Parse decision - pass context so fallback can pick a better default
+                decision = self.parse_llm_response(response_content, context)
                 action = decision.get("action", "UNKNOWN")
                 reasoning = decision.get("reasoning", "")
                 parameters = decision.get("parameters", {})
