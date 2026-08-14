@@ -127,6 +127,7 @@ class AssetSyncAgent:
         run_status = self.checkpointer.get_run_status(self.run_id)
         completed_steps = self.checkpointer.get_completed_steps(self.run_id)
         failed_steps = self.checkpointer.get_failed_steps(self.run_id)
+        partial_steps = self.checkpointer.get_partial_steps(self.run_id)
         execution_trace = self.checkpointer.get_execution_trace(self.run_id)
         
         return {
@@ -134,6 +135,7 @@ class AssetSyncAgent:
             "status": run_status["status"] if run_status else "UNKNOWN",
             "completed_steps": completed_steps,
             "failed_steps": failed_steps,
+            "partial_steps": partial_steps,
             "execution_trace": execution_trace
         }
     
@@ -167,9 +169,10 @@ FAILURE HANDLING RULES:
   - DO NOT retry the failed step.
   - You MUST output action "halt" with reasoning explaining: "[Service] service is reported as DOWN by health check. Pausing workflow until service recovers."
 - Only retry a failed step after health check confirms ALL services are HEALTHY (True).
+- PARTIAL FAILURE RULE: A step listed under "Partial" has ALREADY committed its write server-side (the response was just incomplete). DO NOT retry it - proceed to the NEXT step in the workflow.
 
 RULES:
-- Never repeat completed steps
+- Never repeat completed or partial steps
 - Return ONLY valid JSON: {"action": "...", "reasoning": "...", "parameters": {...}}
 - Use "DONE" when all steps complete
 - Be brief and respond immediately"""
@@ -177,9 +180,11 @@ RULES:
         # Build execution history summary (brief format)
         completed_names = [s["step_name"] for s in context["completed_steps"]]
         failed_names = [s["step_name"] for s in context["failed_steps"]]
+        partial_names = [s["step_name"] for s in context.get("partial_steps", [])]
         
         user_message = f"""Completed: {completed_names}
 Failed: {failed_names}
+Partial (already committed, do NOT retry): {partial_names}
 
 Decide next action. Return JSON only."""
         
@@ -408,6 +413,12 @@ Decide next action. Return JSON only."""
             print(f"[INFO] Re-running with existing ID '{self.run_id}' - clearing previous data")
             self.checkpointer.clear_run(self.run_id)
         
+        # Emit run-started event to the audit trail (Upgrade 2)
+        self.checkpointer.emit_event(
+            self.run_id, "RUN_STARTED",
+            details={"max_iterations": MAX_ITERATIONS}
+        )
+        
         while iteration < MAX_ITERATIONS:
             iteration += 1
             print(f"\n--- Iteration {iteration} ---\n")
@@ -415,22 +426,44 @@ Decide next action. Return JSON only."""
             # Get current state
             context = self.get_execution_context()
             
-            # Check if all required steps are completed - auto-complete if so
-            completed_step_names = set(s["step_name"] for s in context["completed_steps"])
-            required_steps = {"fetch_location", "validate_consistency", "write_db_correction", "update_cache"}
-            
-            if required_steps.issubset(completed_step_names):
-                print("[OK] All required steps completed! Auto-completing workflow.")
-                self.checkpointer.complete_run(self.run_id)
-                return {
-                    "status": "COMPLETED",
-                    "iterations": iteration,
-                    "summary": "Asset synchronization completed (auto-detected)"
-                }
+            # Check if all required steps are completed - auto-complete if so.
+            # A step in PARTIAL_FAILURE counts as "done" for progression: the
+            # mutation likely committed server-side, so re-executing would be a
+            # duplicate write. We proceed to the next step instead.
+            #
+            # IMPORTANT: We only auto-complete when NO failure is pending
+            # reconciliation. If a step just failed (e.g. cache timeout ->
+            # UNKNOWN), we must run the health check / halt logic first rather
+            # than declaring success over an indeterminate state.
+            if not self._force_health_check:
+                completed_step_names = set(s["step_name"] for s in context["completed_steps"])
+                partial_step_names = set(s["step_name"] for s in context["partial_steps"])
+                done_step_names = completed_step_names | partial_step_names
+                required_steps = {"fetch_location", "validate_consistency", "write_db_correction", "update_cache"}
+                
+                if required_steps.issubset(done_step_names):
+                    print("[OK] All required steps completed! Auto-completing workflow.")
+                    self.checkpointer.emit_event(
+                        self.run_id, "RUN_COMPLETED",
+                        details={"reason": "all_steps_completed"}
+                    )
+                    self.checkpointer.complete_run(self.run_id)
+                    return {
+                        "status": "COMPLETED",
+                        "iterations": iteration,
+                        "summary": "Asset synchronization completed (auto-detected)"
+                    }
             
             # INTELLIGENT RECOVERY: If a step just failed, force check_system_health
             if self._force_health_check:
                 print("[INFO] Step failed - forcing intelligent recovery via health check\n")
+                
+                # Emit reconciliation event to the audit trail (Upgrade 2)
+                self.checkpointer.emit_event(
+                    self.run_id, "RECONCILIATION_STARTED",
+                    sub_task=last_failed_action,
+                    details={"trigger": "step_failure", "action": "check_system_health"}
+                )
                 
                 # Execute health check directly (no LLM needed)
                 from stubs.services import check_service_health
@@ -453,6 +486,13 @@ Decide next action. Return JSON only."""
                 if down_services:
                     print(f"[INFO] Services DOWN: {', '.join(down_services)}")
                     print(f"[INFO] Workflow halted by agent - service recovery required\n")
+                    
+                    # Emit halt event to the audit trail (Upgrade 2)
+                    self.checkpointer.emit_event(
+                        self.run_id, "WORKFLOW_HALTED",
+                        details={"down_services": down_services,
+                                 "reason": "service_unavailable"}
+                    )
                     self.checkpointer.complete_run(self.run_id)
                     return {
                         "status": "COMPLETED",  # Intelligently halted, not failed
@@ -519,6 +559,10 @@ Decide next action. Return JSON only."""
                 # Execute the action
                 if action == "DONE":
                     print("[OK] All steps completed successfully!")
+                    self.checkpointer.emit_event(
+                        self.run_id, "RUN_COMPLETED",
+                        details={"reason": "llm_signaled_done"}
+                    )
                     self.checkpointer.complete_run(self.run_id)
                     
                     return {
@@ -532,6 +576,18 @@ Decide next action. Return JSON only."""
                 if not success:
                     print(f"[FAIL] {action}: {result.get('error', 'Unknown error')}")
                     
+                    # Surface granular sub-task status (Upgrade 1)
+                    # A timeout is not a hard failure - the sub-task may be UNKNOWN
+                    # (the write might have committed server-side).
+                    sub_tasks = self.checkpointer.get_sub_tasks(self.run_id, action)
+                    if sub_tasks:
+                        print(f"  [SUBTASKS] {action}:")
+                        for st in sub_tasks:
+                            marker = {"SUCCESS": "OK", "FAILED": "FAIL",
+                                      "UNKNOWN": "UNKNOWN"}.get(st["status"], st["status"])
+                            tx = f" (tx={st['tx_id']})" if st.get("tx_id") else ""
+                            print(f"    - {st['sub_task_name']}: [{marker}]{tx}")
+                    
                     # Track the failed action for intelligent recovery
                     last_failed_action = action
                     
@@ -541,6 +597,10 @@ Decide next action. Return JSON only."""
                     # If we keep failing the same action after health check, mark as FAILED
                     if iteration >= MAX_ITERATIONS - 1:
                         print("[WARN] Approaching max iterations - marking run as FAILED")
+                        self.checkpointer.emit_event(
+                            self.run_id, "RUN_FAILED",
+                            details={"reason": "max_iterations", "failed_action": action}
+                        )
                         self.checkpointer.fail_run(self.run_id, "Max iterations reached")
                         return {
                             "status": "FAILED",
@@ -550,6 +610,10 @@ Decide next action. Return JSON only."""
                 
             except Exception as e:
                 print(f"[ERROR] Error in execution loop: {e}")
+                self.checkpointer.emit_event(
+                    self.run_id, "RUN_FAILED",
+                    details={"reason": "exception", "error": str(e)}
+                )
                 self.checkpointer.fail_run(self.run_id, str(e))
                 return {
                     "status": "ERROR",
@@ -559,6 +623,10 @@ Decide next action. Return JSON only."""
         
         # Max iterations reached
         print(f"\n[WARN] Reached max iterations ({MAX_ITERATIONS})")
+        self.checkpointer.emit_event(
+            self.run_id, "RUN_FAILED",
+            details={"reason": "max_iterations_exceeded"}
+        )
         self.checkpointer.fail_run(self.run_id, "Max iterations exceeded")
         return {
             "status": "FAILED",

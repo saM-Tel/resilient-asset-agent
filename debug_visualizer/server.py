@@ -106,6 +106,49 @@ def get_run_data(run_id: str = None) -> dict:
             }
             decisions.append(decision)
         
+        # Get sub-tasks (Upgrade 1) - granular per-component status
+        sub_tasks = []
+        try:
+            cursor.execute(
+                "SELECT step_name, sub_task_name, status, tx_id, idempotency_key, error_message, timestamp FROM sub_tasks WHERE run_id = ? ORDER BY id ASC",
+                (run_id,)
+            )
+            for row in cursor.fetchall():
+                sub_tasks.append({
+                    "step_name": row[0],
+                    "sub_task_name": row[1],
+                    "status": row[2],
+                    "tx_id": row[3],
+                    "idempotency_key": row[4],
+                    "error": row[5],
+                    "timestamp": row[6]
+                })
+        except sqlite3.OperationalError:
+            pass  # Table may not exist on older DBs
+        
+        # Get events (Upgrade 2) - append-only audit trail
+        events = []
+        try:
+            cursor.execute(
+                "SELECT event, sub_task, tx_id, details, timestamp FROM events WHERE run_id = ? ORDER BY id ASC",
+                (run_id,)
+            )
+            for row in cursor.fetchall():
+                event = {
+                    "event": row[0],
+                    "sub_task": row[1],
+                    "tx_id": row[2],
+                    "timestamp": row[4]
+                }
+                if row[3]:
+                    try:
+                        event["details"] = json.loads(row[3])
+                    except:
+                        event["details"] = row[3]
+                events.append(event)
+        except sqlite3.OperationalError:
+            pass  # Table may not exist on older DBs
+        
         # Get all runs for sidebar
         cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 20")
         all_runs = []
@@ -130,8 +173,10 @@ def get_run_data(run_id: str = None) -> dict:
             "run_info": run_info,
             "steps": steps,
             "decisions": decisions,
+            "sub_tasks": sub_tasks,
+            "events": events,
             "all_runs": all_runs,
-            "debug": f"Loaded {len(steps)} steps and {len(decisions)} decisions"
+            "debug": f"Loaded {len(steps)} steps, {len(decisions)} decisions, {len(sub_tasks)} sub-tasks, {len(events)} events"
         }
     
     except Exception as e:
@@ -449,6 +494,99 @@ HTML_TEMPLATE = """
             color: #8b949e;
         }
         
+        .step.partial-failure {
+            border-left-color: #d29922;
+            background: #3d2d0a;
+        }
+        
+        .step-status.partial-failure {
+            background: #9e6a03;
+            color: white;
+        }
+        
+        /* Sub-task badges (Upgrade 1) */
+        .subtask-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px dashed #30363d;
+        }
+        
+        .subtask-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-family: 'Courier New', monospace;
+            background: #0d1117;
+            border: 1px solid #30363d;
+        }
+        
+        .subtask-badge .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        
+        .subtask-badge.success .dot { background: #3fb950; }
+        .subtask-badge.failed .dot { background: #f85149; }
+        .subtask-badge.unknown .dot { background: #d29922; }
+        .subtask-badge.pending .dot { background: #6e40aa; }
+        
+        .subtask-badge .tx {
+            color: #8b949e;
+            font-size: 10px;
+        }
+        
+        /* Event log / audit trail (Upgrade 2) */
+        .event-log {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 12px;
+            font-family: 'Courier New', monospace;
+            font-size: 11px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .event-line {
+            padding: 4px 0;
+            border-bottom: 1px solid #161b22;
+            line-height: 1.5;
+            word-break: break-all;
+        }
+        
+        .event-line:last-child {
+            border-bottom: none;
+        }
+        
+        .event-line .ts {
+            color: #8b949e;
+        }
+        
+        .event-line .evt {
+            font-weight: 600;
+            padding: 1px 6px;
+            border-radius: 3px;
+            margin: 0 4px;
+        }
+        
+        .evt-run .evt { background: #1f6feb; color: white; }
+        .evt-subtask .evt { background: #238636; color: white; }
+        .evt-timeout .evt { background: #9e6a03; color: white; }
+        .evt-failure .evt { background: #da3633; color: white; }
+        .evt-recon .evt { background: #6e40aa; color: white; }
+        .evt-default .evt { background: #30363d; color: #c9d1d9; }
+        
+        .event-line .detail {
+            color: #8b949e;
+        }
+        
         .step-content {
             font-size: 12px;
             color: #8b949e;
@@ -625,6 +763,12 @@ HTML_TEMPLATE = """
                 <h2>LLM Decisions</h2>
                 <div id="decisionsContainer" class="loading">Loading...</div>
             </div>
+            
+            <!-- Audit Trail Section (Upgrade 2) -->
+            <div class="section">
+                <h2>Audit Trail (Event Log)</h2>
+                <div id="eventsContainer" class="loading">Loading...</div>
+            </div>
         </div>
     </div>
     
@@ -632,6 +776,16 @@ HTML_TEMPLATE = """
         let autoRefreshInterval = null;
         let currentMode = 'latest'; // 'latest' or 'monitor'
         let monitoredRunId = null;
+        
+        // Categorize events for color-coding in the audit trail (Upgrade 2)
+        function eventCategory(event) {
+            if (event.startsWith('RUN_')) return 'evt-run';
+            if (event.startsWith('SUBTASK_')) return 'evt-subtask';
+            if (event.includes('TIMEOUT')) return 'evt-timeout';
+            if (event.includes('FAIL') || event.includes('HALTED')) return 'evt-failure';
+            if (event.includes('RECONCILIATION')) return 'evt-recon';
+            return 'evt-default';
+        }
         
         function setMode(mode) {
             currentMode = mode;
@@ -767,7 +921,28 @@ HTML_TEMPLATE = """
                     
                     const uniqueSteps = Array.from(stepMap.values());
                     
-                    stepsContainer.innerHTML = uniqueSteps.map((step, index) => `
+                    // Group sub-tasks by step name (Upgrade 1)
+                    const subtaskMap = new Map();
+                    (data.sub_tasks || []).forEach(st => {
+                        if (!subtaskMap.has(st.step_name)) subtaskMap.set(st.step_name, []);
+                        subtaskMap.get(st.step_name).push(st);
+                    });
+                    
+                    stepsContainer.innerHTML = uniqueSteps.map((step, index) => {
+                        const stepSubtasks = subtaskMap.get(step.step_name) || [];
+                        const subtaskHtml = stepSubtasks.length > 0 ? `
+                            <div class="subtask-list">
+                                ${stepSubtasks.map(st => `
+                                    <span class="subtask-badge ${st.status.toLowerCase()}">
+                                        <span class="dot"></span>
+                                        ${st.sub_task_name}
+                                        ${st.tx_id ? `<span class="tx">${st.tx_id}</span>` : ''}
+                                    </span>
+                                `).join('')}
+                            </div>
+                        ` : '';
+                        
+                        return `
                         <div class="step ${(step.status || 'pending').toLowerCase()}">
                             <div class="step-header">
                                 <div>
@@ -781,9 +956,11 @@ HTML_TEMPLATE = """
                             <div class="step-content">
                                 ${step.error ? `<strong>Error:</strong> ${step.error}` : ''}
                                 ${step.output_data ? `<strong>Output:</strong><br><pre>${JSON.stringify(step.output_data, null, 2)}</pre>` : ''}
+                                ${subtaskHtml}
                             </div>
                         </div>
-                    `).join('');
+                    `;
+                    }).join('');
                 }
                 
                 // Render decisions
@@ -807,6 +984,27 @@ HTML_TEMPLATE = """
                             </div>
                         `;
                     }).join('');
+                }
+                
+                // Render audit trail / event log (Upgrade 2)
+                const eventsContainer = document.getElementById('eventsContainer');
+                if (!data.events || data.events.length === 0) {
+                    eventsContainer.innerHTML = '<div class="loading">No events recorded yet</div>';
+                } else {
+                    eventsContainer.innerHTML = `<div class="event-log">` + data.events.map(ev => {
+                        const ts = new Date(ev.timestamp * 1000).toLocaleTimeString();
+                        const evtClass = eventCategory(ev.event);
+                        const detailStr = ev.details ? JSON.stringify(ev.details) : '';
+                        const subtaskStr = ev.sub_task ? ` subtask=${ev.sub_task}` : '';
+                        const txStr = ev.tx_id ? ` tx=${ev.tx_id}` : '';
+                        return `
+                            <div class="event-line ${evtClass}">
+                                <span class="ts">${ts}</span>
+                                <span class="evt">${ev.event}</span>
+                                <span class="detail">${subtaskStr}${txStr}${detailStr ? ' ' + detailStr : ''}</span>
+                            </div>
+                        `;
+                    }).join('') + `</div>`;
                 }
                 
                 loadRuns();

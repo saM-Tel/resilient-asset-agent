@@ -21,7 +21,9 @@ The agent will:
 """
 
 import argparse
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
@@ -59,6 +61,39 @@ def configure_failure_injection(args: argparse.Namespace) -> None:
     if args.partial_write:
         ServiceConfig.partial_write = True
         print("[WARN] FAILURE INJECTION: Database will perform partial write")
+
+
+def print_audit_trail(checkpointer: Checkpointer, run_id: str) -> None:
+    """
+    Print the append-only event log (mission log) for a run (Upgrade 2).
+    
+    Renders the audit trail as a chronological stream of JSON events,
+    mirroring the format used by distributed orchestration systems.
+    """
+    events = checkpointer.get_events(run_id)
+    if not events:
+        return
+    
+    print(f"\n{'='*60}")
+    print("  Audit Trail (Append-Only Event Log)")
+    print(f"{'='*60}")
+    
+    for ev in events:
+        ts = datetime.fromtimestamp(ev["timestamp"]).strftime("%Y-%m-%dT%H:%M:%SZ")
+        record = {
+            "timestamp": ts,
+            "run_id": run_id,
+            "event": ev["event"],
+        }
+        if ev.get("sub_task"):
+            record["subtask"] = ev["sub_task"]
+        if ev.get("tx_id"):
+            record["tx_id"] = ev["tx_id"]
+        if ev.get("details"):
+            record.update(ev["details"])
+        print(json.dumps(record))
+    
+    print(f"{'='*60}\n")
 
 
 def main():
@@ -135,6 +170,9 @@ def main():
         print(f"  Iterations: {result['iterations']}")
         print(f"  Summary: {result['summary']}")
         print(f"{'='*60}\n")
+        
+        # Print the append-only audit trail (Upgrade 2)
+        print_audit_trail(checkpointer, args.run_id)
         
     finally:
         checkpointer.close()

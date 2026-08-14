@@ -151,7 +151,12 @@ def execute_validate_consistency(checkpointer: Checkpointer, run_id: str,
 def execute_write_db(checkpointer: Checkpointer, run_id: str, 
                       correction_data: dict) -> ToolResult:
     """
-    Write corrections to database with idempotency guard.
+    Write corrections to database with idempotency guard and sub-task tracking.
+    
+    Implements Upgrade 1 (Sub-Task Granularity) and Upgrade 3 (Idempotency Keys):
+    - Generates idempotency key: f"{run_id}:write_db_correction:database_write"
+    - Tracks database_write sub-task with SUCCESS/FAILED/UNKNOWN status
+    - Emits events to audit trail for every sub-task transition
     
     Args:
         checkpointer: Checkpoint store instance
@@ -159,40 +164,111 @@ def execute_write_db(checkpointer: Checkpointer, run_id: str,
         correction_data: Data to write (lat, lng, status)
         
     Returns:
-        ToolResult with transaction confirmation
+        ToolResult with transaction confirmation and sub-task status
     """
-    # Idempotency check
+    # Idempotency check - skip if already completed OR partially failed.
+    # A PARTIAL_FAILURE means the DB write committed server-side (only the
+    # response was incomplete), so re-executing would be a duplicate write.
     existing = checkpointer.get_step_result(run_id, "write_db_correction")
-    if existing and existing["status"] == "COMPLETED":
-        print("  [SKIP] write_db_correction: Already completed, using cached result")
+    if existing and existing["status"] in ("COMPLETED", "PARTIAL_FAILURE"):
+        status_label = existing["status"]
+        print(f"  [SKIP] write_db_correction: Already {status_label}, not re-executing (idempotency)")
         return ToolResult(success=True, data=existing.get("output_data"))
+    
+    # Generate idempotency key for this mutation (Upgrade 3)
+    idempotency_key = f"{run_id}:write_db_correction:database_write"
+    
+    # Emit event: step started (Upgrade 2)
+    checkpointer.emit_event(run_id, "STEP_STARTED", sub_task="database_write", 
+                           tx_id=None, details={"idempotency_key": idempotency_key})
     
     # Execute the tool
     try:
         print("  [EXECUTE] write_db_correction: Writing to database...")
-        result = write_db_correction("asset_001", correction_data)
+        result = write_db_correction("asset_001", correction_data, 
+                                     idempotency_key=idempotency_key)
+        
+        tx_id = result.get('tx_id', 'unknown')
+        
+        # Check for partial write - database succeeded but response incomplete
+        if result.get('status') == 'partial':
+            # Sub-task 1: database_write succeeded (Upgrade 1)
+            checkpointer.save_sub_task(
+                run_id=run_id, step_name="write_db_correction",
+                sub_task_name="database_write", status="SUCCESS", tx_id=tx_id,
+                idempotency_key=idempotency_key
+            )
+            checkpointer.emit_event(run_id, "SUBTASK_COMMITTED", sub_task="database_write",
+                                   tx_id=tx_id, details={"status": "partial_response"})
+            
+            # Mark step as PARTIAL_FAILURE (Upgrade 1)
+            checkpointer.save_step(
+                run_id=run_id, step_name="write_db_correction", step_order=3,
+                status="PARTIAL_FAILURE",
+                input_data={"correction_data": correction_data},
+                output_data=result,
+                error_message="Database write succeeded but returned partial response",
+                idempotency_key=idempotency_key
+            )
+            
+            print(f"  [PARTIAL] write_db_correction: DB written but incomplete response (tx={tx_id})")
+            return ToolResult(success=True, data={**result, "sub_task_status": "PARTIAL_FAILURE"})
+        
+        # Normal successful write
+        checkpointer.save_sub_task(
+            run_id=run_id, step_name="write_db_correction",
+            sub_task_name="database_write", status="SUCCESS", tx_id=tx_id,
+            idempotency_key=idempotency_key
+        )
+        checkpointer.emit_event(run_id, "SUBTASK_COMMITTED", sub_task="database_write",
+                               tx_id=tx_id, details={"status": "completed"})
         
         checkpointer.save_step(
-            run_id=run_id,
-            step_name="write_db_correction",
-            step_order=3,
+            run_id=run_id, step_name="write_db_correction", step_order=3,
             status="COMPLETED",
             input_data={"correction_data": correction_data},
-            output_data=result
+            output_data=result,
+            idempotency_key=idempotency_key
         )
         
-        print(f"  [OK] write_db_correction: Transaction {result['tx_id']} ({result['status']})")
+        print(f"  [OK] write_db_correction: Transaction {tx_id} ({result['status']})")
         return ToolResult(success=True, data=result)
+    
+    except TimeoutError as e:
+        # Network timeout - result UNKNOWN (Upgrade 1)
+        error_msg = str(e)
+        checkpointer.save_sub_task(
+            run_id=run_id, step_name="write_db_correction",
+            sub_task_name="database_write", status="UNKNOWN", error_message=error_msg,
+            idempotency_key=idempotency_key
+        )
+        checkpointer.emit_event(run_id, "NETWORK_TIMEOUT", sub_task="database_write",
+                               tx_id=None, details={"error": error_msg})
+        checkpointer.save_step(
+            run_id=run_id, step_name="write_db_correction", step_order=3,
+            status="PARTIAL_FAILURE",
+            input_data={"correction_data": correction_data},
+            error_message=f"TimeoutError: {error_msg}",
+            idempotency_key=idempotency_key
+        )
+        print(f"  [UNKNOWN] write_db_correction: {error_msg} (write may have succeeded)")
+        return ToolResult(success=False, error=error_msg)
     
     except Exception as e:
         error_msg = str(e)
+        checkpointer.save_sub_task(
+            run_id=run_id, step_name="write_db_correction",
+            sub_task_name="database_write", status="FAILED", error_message=error_msg,
+            idempotency_key=idempotency_key
+        )
+        checkpointer.emit_event(run_id, "SUBTASK_FAILED", sub_task="database_write",
+                               tx_id=None, details={"error": error_msg})
         checkpointer.save_step(
-            run_id=run_id,
-            step_name="write_db_correction",
-            step_order=3,
+            run_id=run_id, step_name="write_db_correction", step_order=3,
             status="FAILED",
             input_data={"correction_data": correction_data},
-            error_message=error_msg
+            error_message=error_msg,
+            idempotency_key=idempotency_key
         )
         print(f"  [FAIL] write_db_correction: {error_msg}")
         return ToolResult(success=False, error=error_msg)
@@ -201,7 +277,13 @@ def execute_write_db(checkpointer: Checkpointer, run_id: str,
 def execute_update_cache(checkpointer: Checkpointer, run_id: str, 
                           cache_data: dict) -> ToolResult:
     """
-    Update cache with idempotency guard.
+    Update cache with idempotency guard and sub-task tracking.
+    
+    Implements Upgrade 1 (Sub-Task Granularity) and Upgrade 3 (Idempotency Keys):
+    - Generates idempotency key: f"{run_id}:update_cache:cache_invalidation"
+    - Tracks cache_invalidation sub-task with SUCCESS/FAILED/UNKNOWN status
+    - Emits events to audit trail for every sub-task transition
+    - Handles UNKNOWN status when cache times out (write may have succeeded)
     
     This is the most failure-prone step - simulates a service that can timeout
     or fail independently even when DB write succeeded.
@@ -212,40 +294,87 @@ def execute_update_cache(checkpointer: Checkpointer, run_id: str,
         cache_data: Data to cache
         
     Returns:
-        ToolResult with cache update confirmation
+        ToolResult with cache update confirmation and sub-task status
     """
-    # Idempotency check
+    # Idempotency check - skip if already completed OR partially failed.
+    # A PARTIAL_FAILURE (timeout) means the cache write may have committed
+    # server-side, so re-executing risks a duplicate write.
     existing = checkpointer.get_step_result(run_id, "update_cache")
-    if existing and existing["status"] == "COMPLETED":
-        print("  [SKIP] update_cache: Already completed, using cached result")
+    if existing and existing["status"] in ("COMPLETED", "PARTIAL_FAILURE"):
+        status_label = existing["status"]
+        print(f"  [SKIP] update_cache: Already {status_label}, not re-executing (idempotency)")
         return ToolResult(success=True, data=existing.get("output_data"))
+    
+    # Generate idempotency key for this mutation (Upgrade 3)
+    idempotency_key = f"{run_id}:update_cache:cache_invalidation"
+    
+    # Emit event: step started (Upgrade 2)
+    checkpointer.emit_event(run_id, "STEP_STARTED", sub_task="cache_invalidation",
+                           tx_id=None, details={"idempotency_key": idempotency_key})
     
     # Execute the tool
     try:
         print("  [EXECUTE] update_cache: Updating distributed cache...")
-        result = update_cache("asset_001", cache_data)
+        result = update_cache("asset_001", cache_data,
+                             idempotency_key=idempotency_key)
+        
+        tx_id = result.get('tx_id', 'unknown')
+        
+        # Successful cache update
+        checkpointer.save_sub_task(
+            run_id=run_id, step_name="update_cache",
+            sub_task_name="cache_invalidation", status="SUCCESS", tx_id=tx_id,
+            idempotency_key=idempotency_key
+        )
+        checkpointer.emit_event(run_id, "SUBTASK_COMMITTED", sub_task="cache_invalidation",
+                               tx_id=tx_id, details={"status": "SUCCESS"})
         
         checkpointer.save_step(
-            run_id=run_id,
-            step_name="update_cache",
-            step_order=4,
+            run_id=run_id, step_name="update_cache", step_order=4,
             status="COMPLETED",
             input_data={"cache_data": cache_data},
-            output_data=result
+            output_data=result,
+            idempotency_key=idempotency_key
         )
         
-        print(f"  [OK] update_cache: Cache updated successfully")
+        print(f"  [OK] update_cache: Cache updated successfully (tx={tx_id})")
         return ToolResult(success=True, data=result)
+    
+    except TimeoutError as e:
+        # Network timeout - result UNKNOWN (Upgrade 1)
+        error_msg = str(e)
+        checkpointer.save_sub_task(
+            run_id=run_id, step_name="update_cache",
+            sub_task_name="cache_invalidation", status="UNKNOWN", error_message=error_msg,
+            idempotency_key=idempotency_key
+        )
+        checkpointer.emit_event(run_id, "NETWORK_TIMEOUT", sub_task="cache_invalidation",
+                               tx_id=None, details={"error": error_msg})
+        checkpointer.save_step(
+            run_id=run_id, step_name="update_cache", step_order=4,
+            status="PARTIAL_FAILURE",
+            input_data={"cache_data": cache_data},
+            error_message=f"TimeoutError: {error_msg}",
+            idempotency_key=idempotency_key
+        )
+        print(f"  [UNKNOWN] update_cache: {error_msg} (cache update may have succeeded)")
+        return ToolResult(success=False, error=error_msg)
     
     except Exception as e:
         error_msg = str(e)
+        checkpointer.save_sub_task(
+            run_id=run_id, step_name="update_cache",
+            sub_task_name="cache_invalidation", status="FAILED", error_message=error_msg,
+            idempotency_key=idempotency_key
+        )
+        checkpointer.emit_event(run_id, "SUBTASK_FAILED", sub_task="cache_invalidation",
+                               tx_id=None, details={"error": error_msg})
         checkpointer.save_step(
-            run_id=run_id,
-            step_name="update_cache",
-            step_order=4,
+            run_id=run_id, step_name="update_cache", step_order=4,
             status="FAILED",
             input_data={"cache_data": cache_data},
-            error_message=error_msg
+            error_message=error_msg,
+            idempotency_key=idempotency_key
         )
         print(f"  [FAIL] update_cache: {error_msg}")
         return ToolResult(success=False, error=error_msg)
