@@ -348,9 +348,13 @@ Decide next action. Return JSON only."""
         print(f"Starting Asset Sync Agent - Run ID: {self.run_id}")
         print(f"{'='*60}\n")
         
-        # Clear previous run data if this run_id already exists (clean slate for re-runs)
+        # Ensure run record exists in the runs table (create it if missing)
         existing_run = self.checkpointer.get_run_status(self.run_id)
-        if existing_run:
+        if not existing_run:
+            print(f"[INFO] Creating new run '{self.run_id}'")
+            self.checkpointer.create_run(self.run_id)
+        elif existing_run["status"] != "IN_PROGRESS":
+            # Re-running a completed/failed run - clear previous data for clean slate
             print(f"[INFO] Re-running with existing ID '{self.run_id}' - clearing previous data")
             self.checkpointer.clear_run(self.run_id)
         
