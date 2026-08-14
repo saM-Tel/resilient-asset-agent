@@ -99,12 +99,12 @@ This demonstrates **idempotent execution and intelligent failure recovery**.
 
 ## How It Works
 
-The visualizer reads from the SQLite checkpoint database (`agent_state.db`) that the agent maintains:
+The visualizer reads from the SQLite checkpoint database (`data/agent_state.db`) that the agent maintains:
 
 ```
 ┌──────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │  Agent Run   │────▶│  agent_state.db  │────▶│ Flask Dashboard │
-│ (main.py)    │     │  (SQLite)        │     │ (:5000)         │
+│ (main.py)    │     │  (SQLite, data/) │     │ (:5000)         │
 └──────────────┘     └──────────────────┘     └─────────────────┘
                        Tables:
                          - runs (run_id, status, created_at, completed_at)
@@ -138,7 +138,7 @@ curl http://localhost:5000/api/debug
 | Problem | Solution |
 |---------|----------|
 | Port 5000 already in use | Edit `server.py`: change `port=5000` to another port |
-| Blank "Loading..." screen | Run the agent at least once (`python main.py --run-id test-001`) so `agent_state.db` exists |
+| Blank "Loading..." screen | Run the agent at least once (`python main.py --run-id test-001`) so `data/agent_state.db` exists |
 | No data showing | Check browser console (F12), verify Flask is running, confirm DB file exists |
 | ModuleNotFoundError: flask | `pip install -r debug_visualizer/requirements.txt` |
 

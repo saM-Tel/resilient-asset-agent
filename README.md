@@ -230,12 +230,14 @@ resilient-asset-agent/
 │   ├── tools.py           # Idempotent tool wrappers around stubs
 │   └── runner.py          # LLM prompt loop & dynamic decision maker
 ├── debug_visualizer/
-│   ├── server.py          # Flask real-time dashboard (reads agent_state.db)
+│   ├── server.py          # Flask real-time dashboard (reads data/agent_state.db)
 │   ├── requirements.txt   # Flask dependencies
 │   ├── run.bat / run.ps1  # Launchers
 │   └── README.md          # Visualizer docs
+├── data/                  # Persistent state volume (agent_state.db, gitignored)
 ├── tests/
-│   └── test_resilience.py # Automated pytest suite (idempotency, recovery, health)
+│   ├── test_resilience.py # Automated pytest suite (idempotency, recovery, health)
+│   └── test_edge_cases.py # Edge-case verification suite
 ├── .github/
 │   └── workflows/
 │       └── ci.yml         # GitHub Actions CI (runs pytest on push/PR to main)
@@ -245,7 +247,6 @@ resilient-asset-agent/
 ├── Dockerfile             # python:3.12-slim container image
 ├── docker-compose.yml     # One-command startup (mounts ./data, wires LLM URL)
 ├── main.py                # Main CLI runner (with failure injection flags)
-├── test_edge_cases.py     # Edge-case verification suite
 └── README.md              # This file
 ```
 

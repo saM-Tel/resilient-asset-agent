@@ -28,8 +28,11 @@ class Checkpointer:
     3. Full audit trail of all decisions and outcomes
     """
     
-    def __init__(self, db_path: str = "agent_state.db"):
+    def __init__(self, db_path: str = "data/agent_state.db"):
         self.db_path = Path(db_path)
+        # Ensure the parent directory exists so the DB can be created.
+        # This keeps state on a persistent volume (e.g. Docker ./data mount).
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), timeout=10.0)
         self._create_tables()
     

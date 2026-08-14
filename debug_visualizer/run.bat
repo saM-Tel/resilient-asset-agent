@@ -33,7 +33,7 @@ echo Installing/checking Flask...
 pip install -q Flask==2.3.0 Werkzeug==2.3.0
 
 REM Check if agent_state.db exists
-if not exist "agent_state.db" (
+if not exist "..\data\agent_state.db" (
     echo.
     echo WARNING: agent_state.db not found
     echo Run the agent first: python main.py --run-id test-001
@@ -47,7 +47,7 @@ echo   Starting Debug Visualizer...
 echo ================================================================
 echo.
 echo ^[OK^] Open browser: http://localhost:5000
-echo ^[OK^] Monitoring: agent_state.db
+echo ^[OK^] Monitoring: data\agent_state.db
 echo.
 echo Press Ctrl+C to stop
 echo.

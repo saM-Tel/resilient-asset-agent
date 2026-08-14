@@ -155,7 +155,9 @@ def main():
         print("   Make sure llama-server.exe is running on port 8000")
         sys.exit(1)
     
-    checkpointer = Checkpointer(db_path="agent_state.db")
+    # Persist state under ./data so it survives container restarts
+    # (docker-compose mounts ./data:/app/data).
+    checkpointer = Checkpointer(db_path="data/agent_state.db")
     
     try:
         # Create and run the agent

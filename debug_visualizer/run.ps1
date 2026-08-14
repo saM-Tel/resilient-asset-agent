@@ -32,7 +32,7 @@ Write-Host "[OK] Checking Flask..." -ForegroundColor Green
 pip install -q Flask==2.3.0 Werkzeug==2.3.0
 
 # Check database
-$dbPath = Join-Path $PSScriptRoot "..\agent_state.db"
+$dbPath = Join-Path $PSScriptRoot "..\data\agent_state.db"
 if (-Not (Test-Path $dbPath)) {
     Write-Host ""
     Write-Host "[WARN] agent_state.db not found" -ForegroundColor Yellow
@@ -47,7 +47,7 @@ Write-Host "  Starting Debug Visualizer..." -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "[OK] Open browser: http://localhost:5000" -ForegroundColor Green
-Write-Host "[OK] Monitoring: agent_state.db" -ForegroundColor Green
+Write-Host "[OK] Monitoring: data/agent_state.db" -ForegroundColor Green
 Write-Host ""
 Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
 Write-Host ""
