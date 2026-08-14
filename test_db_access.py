@@ -81,10 +81,10 @@ try:
     
     conn.close()
     print("\n" + "="*70)
-    print("✓ ALL TESTS PASSED - Database is readable!")
+    print("[OK] ALL TESTS PASSED - Database is readable!")
     print("="*70 + "\n")
     
 except Exception as e:
-    print(f"\n✗ ERROR: {e}")
+    print(f"\n[ERROR] {e}")
     import traceback
     traceback.print_exc()

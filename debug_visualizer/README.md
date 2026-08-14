@@ -152,6 +152,8 @@ The initial visualizer showed "Loading..." forever because it used wrong column 
 - ✅ All SQL queries now use correct schema
 - ✅ JSON parsing works for input/output data
 - ✅ Dashboard shows real data in real-time
+- ✅ **N+1 query elimination**: `api_runs`/`get_run_data` now use batched single-query fetches instead of per-run query loops
+- ✅ **Concurrency safety**: `timeout=10.0` on DB connections prevents lock collisions with the agent writer
 
 ## Files
 

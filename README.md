@@ -8,7 +8,7 @@ This project implements a **LLM-driven workflow orchestrator** that:
 - Executes multi-step asset synchronization workflows
 - Detects and recovers from partial failures without re-doing completed work
 - Maintains persistent checkpoint state for crash recovery
-- Uses local LLM (Qwen 35B) for dynamic decision-making
+- Uses local LLM (Qwen 3.8-27B) for dynamic decision-making
 
 ## Architecture
 
@@ -35,11 +35,12 @@ graph TD
 - **CacheService**: Fast cache layer (most failure-prone - can timeout independently)
 
 ### `agent/checkpointer.py` - State Persistence
-- SQLite-based checkpoint store
+- SQLite-based checkpoint store (WAL mode + busy timeout for concurrent reads/writes)
 - Idempotency guarantees (never re-executes completed steps)
 - Sub-task tracking with `SUCCESS` / `FAILED` / `UNKNOWN` status
 - Append-only event log (audit trail / mission log)
 - Full execution trace for audit/debugging
+- Resilient JSON serialization (`default=str`) for non-primitive payloads
 
 ### `agent/tools.py` - Idempotent Tool Wrappers
 - Each tool checks checkpoint before execution
@@ -52,6 +53,8 @@ graph TD
 - LLM-driven dynamic workflow (not fixed sequence)
 - Evaluates current state to decide next action
 - Handles max iterations and recovery logic
+- Guards `DONE` action against bypassing pending health checks
+- Robust LLM response parsing (markdown code blocks, empty responses, fallbacks)
 
 ## How to Run It
 
@@ -183,12 +186,18 @@ resilient-asset-agent/
 │   └── services.py        # Mock Location, DB & Cache APIs + failure knobs
 ├── agent/
 │   ├── __init__.py
-│   ├── checkpointer.py    # SQLite / JSON state persistence
+│   ├── checkpointer.py    # SQLite state persistence (WAL, idempotency, audit trail)
 │   ├── tools.py           # Idempotent tool wrappers around stubs
-│   └── runner.py          # Ollama LLM prompt loop & dynamic decision maker
+│   └── runner.py          # LLM prompt loop & dynamic decision maker
+├── debug_visualizer/
+│   ├── server.py          # Flask real-time dashboard (reads agent_state.db)
+│   ├── requirements.txt   # Flask dependencies
+│   ├── run.bat / run.ps1  # Launchers
+│   └── README.md          # Visualizer docs
 ├── .gitignore
 ├── requirements.txt
 ├── main.py                # Main CLI runner (with failure injection flags)
+├── test_edge_cases.py     # Edge-case verification suite
 └── README.md              # This file
 ```
 
@@ -209,8 +218,13 @@ MIT
 | Windows Encoding | Emoji characters (❌✅⏭️) not supported in PowerShell | Replaced with text markers: `[FAIL]`, `[OK]`, `[SKIP]` |
 | Duplicate Execution | No idempotency check before tool calls | Pre-execution checkpoint guard in all tool wrappers |
 | Connection Hangs | No timeout on LLM API calls | Added `timeout=10` and MAX_ITERATIONS limit (10) |
-
-See [BUGS_AND_FIXES.md](BUGS_AND_FIXES.md) for detailed analysis of each fix.
+| Retried Steps Double-Listed | `get_failed_steps()` returned steps that later succeeded | Exclude step names with a subsequent `COMPLETED`/`PARTIAL_FAILURE` row |
+| Non-Deterministic Step Lookup | `get_step_result()` ordered by `completed_at` (NULL for pending) | Order by `id DESC` for deterministic latest-row selection |
+| Already-Synced Not Checkpointed | `write_db_correction` returned early without saving a step | Save a `COMPLETED` step so auto-complete and progression work |
+| `DONE` Bypassed Recovery | LLM could signal `DONE` while a health check was pending | Guard `DONE` behind `_force_health_check` |
+| Duplicate `tx_id` | Second-precision timestamps collided on rapid writes | Millisecond-precision `tx_id` generation |
+| DB Locks (Visualizer + Agent) | Concurrent SQLite reads/writes without WAL | WAL mode, `busy_timeout=5000`, `timeout=10.0` connections |
+| N+1 Visualizer Queries | Per-run queries in a loop for the run list | Batched single-query fetches in `api_runs`/`get_run_data` |
 
 ### Implementation Phases
 

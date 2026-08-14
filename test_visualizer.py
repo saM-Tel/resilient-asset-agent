@@ -1,8 +1,14 @@
-import requests
+import json
 import time
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
+
+def http_get_json(url, timeout=5):
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode('utf-8'))
 
 # Start the visualizer in background
 proc = subprocess.Popen([sys.executable, "debug_visualizer/server.py"], 
@@ -15,20 +21,22 @@ time.sleep(3)
 
 try:
     # Test the API
-    resp = requests.get("http://localhost:5000/api/debug", timeout=5)
-    print("✓ Database API Response:")
-    print(resp.json())
+    data = http_get_json("http://localhost:5000/api/debug", timeout=5)
+    print("[OK] Database API Response:")
+    print(data)
     
-    resp = requests.get("http://localhost:5000/api/current", timeout=5)
-    data = resp.json()
-    print(f"\n✓ Current Run: {data.get('run_id')}")
+    data = http_get_json("http://localhost:5000/api/current", timeout=5)
+    print(f"\n[OK] Current Run: {data.get('run_id')}")
     print(f"  Status: {data.get('run_info', {}).get('status')}")
     print(f"  Steps: {len(data.get('steps', []))}")
     print(f"  Decisions: {len(data.get('decisions', []))}")
     
 except Exception as e:
-    print(f"✗ Error: {e}")
+    print(f"[ERROR] Error: {e}")
 finally:
     proc.terminate()
-    proc.wait()
-    print("\n✓ Server stopped")
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+    print("\n[OK] Server stopped")

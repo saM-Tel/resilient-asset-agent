@@ -151,7 +151,7 @@ def main():
     try:
         client = create_client(args.llm_url)
     except Exception as e:
-        print(f"❌ Failed to connect to LLM server at {args.llm_url}: {e}")
+        print(f"[ERROR] Failed to connect to LLM server at {args.llm_url}: {e}")
         print("   Make sure llama-server.exe is running on port 8000")
         sys.exit(1)
     

@@ -260,7 +260,7 @@ def write_db_correction(asset_id: str, correction_data: dict,
         # Write succeeds but returns incomplete response (simulates partial write)
         _service_state["db_written"] = True
         result = {
-            "tx_id": f"tx_{int(time.time())}",
+            "tx_id": f"tx_{int(time.time() * 1000)}",
             "status": "partial",  # Incomplete response!
             "message": "Write completed with warnings",
             "idempotency_key": idempotency_key
@@ -275,7 +275,7 @@ def write_db_correction(asset_id: str, correction_data: dict,
     _service_state["asset_location"]["status"] = correction_data.get("status", "synced")
     
     result = {
-        "tx_id": f"tx_{int(time.time())}",
+        "tx_id": f"tx_{int(time.time() * 1000)}",
         "status": "completed",
         "message": "Database write successful",
         "idempotency_key": idempotency_key
@@ -335,7 +335,7 @@ def update_cache(asset_id: str, cache_data: dict,
         "cached_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "asset_id": asset_id,
         "ttl_seconds": 3600,
-        "tx_id": f"tx_{int(time.time())}",
+        "tx_id": f"tx_{int(time.time() * 1000)}",
         "idempotency_key": idempotency_key
     }
     _record_idempotency(idempotency_key, result)

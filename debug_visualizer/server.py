@@ -26,7 +26,7 @@ DB_PATH = Path(__file__).parent.parent / "agent_state.db"
 
 def get_db_connection():
     """Create a database connection."""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -39,8 +39,11 @@ def get_run_data(run_id: str = None) -> dict:
     try:
         # Get most recent run if not specified
         if not run_id:
-            cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 1")
+            cursor.execute("SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1")
             result = cursor.fetchone()
+            if not result:
+                cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 1")
+                result = cursor.fetchone()
             run_id = result[0] if result else None
         
         if not run_id:
@@ -150,23 +153,16 @@ def get_run_data(run_id: str = None) -> dict:
             pass  # Table may not exist on older DBs
         
         # Get all runs for sidebar
-        cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 20")
-        all_runs = []
-        for row in cursor.fetchall():
-            run_id_item = row[0]
-            cursor.execute("SELECT status FROM runs WHERE run_id = ? LIMIT 1", (run_id_item,))
-            status_row = cursor.fetchone()
-            status = status_row[0] if status_row else "UNKNOWN"
-            
-            cursor.execute("SELECT MAX(started_at) FROM steps WHERE run_id = ?", (run_id_item,))
-            created_row = cursor.fetchone()
-            created_at = created_row[0] if created_row else None
-            
-            all_runs.append({
-                "run_id": run_id_item,
-                "status": status,
-                "created_at": created_at
-            })
+        cursor.execute("""
+            SELECT r.run_id, r.status, r.created_at
+            FROM runs r
+            ORDER BY r.created_at DESC
+            LIMIT 20
+        """)
+        all_runs = [{"run_id": row[0], "status": row[1], "created_at": row[2]} for row in cursor.fetchall()]
+        if not all_runs:
+            cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 20")
+            all_runs = [{"run_id": row[0], "status": "UNKNOWN", "created_at": None} for row in cursor.fetchall()]
         
         return {
             "run_id": run_id,
@@ -251,19 +247,16 @@ def api_runs():
     cursor = conn.cursor()
     
     try:
-        cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 20")
-        runs = []
-        for row in cursor.fetchall():
-            run_id = row[0]
-            cursor.execute("SELECT status FROM runs WHERE run_id = ? LIMIT 1", (run_id,))
-            status_row = cursor.fetchone()
-            status = status_row[0] if status_row else "UNKNOWN"
-            
-            cursor.execute("SELECT MAX(started_at) FROM steps WHERE run_id = ?", (run_id,))
-            created_row = cursor.fetchone()
-            created_at = created_row[0] if created_row else None
-            
-            runs.append({"run_id": run_id, "status": status, "created_at": created_at})
+        cursor.execute("""
+            SELECT r.run_id, r.status, r.created_at
+            FROM runs r
+            ORDER BY r.created_at DESC
+            LIMIT 20
+        """)
+        runs = [{"run_id": row[0], "status": row[1], "created_at": row[2]} for row in cursor.fetchall()]
+        if not runs:
+            cursor.execute("SELECT DISTINCT run_id FROM steps ORDER BY started_at DESC LIMIT 20")
+            runs = [{"run_id": row[0], "status": "UNKNOWN", "created_at": None} for row in cursor.fetchall()]
         
         return jsonify({"runs": runs})
     except Exception as e:

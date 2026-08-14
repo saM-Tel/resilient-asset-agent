@@ -30,12 +30,14 @@ class Checkpointer:
     
     def __init__(self, db_path: str = "agent_state.db"):
         self.db_path = Path(db_path)
-        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn = sqlite3.connect(str(self.db_path), timeout=10.0)
         self._create_tables()
     
     def _create_tables(self):
         """Create SQLite tables if they don't exist."""
         cursor = self.conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
         
         # Runs table - tracks overall execution status
         cursor.execute("""
@@ -234,8 +236,8 @@ class Checkpointer:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             run_id, step_name, step_order, status,
-            json.dumps(input_data) if input_data else None,
-            json.dumps(output_data) if output_data else None,
+            json.dumps(input_data, default=str) if input_data is not None else None,
+            json.dumps(output_data, default=str) if output_data is not None else None,
             error_message,
             idempotency_key,
             now,
@@ -266,14 +268,15 @@ class Checkpointer:
         return results
     
     def get_failed_steps(self, run_id: str) -> list[dict]:
-        """Get all failed steps for a run."""
+        """Get all failed steps for a run, excluding those that were subsequently completed on retry."""
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT step_name, input_data, error_message, completed_at
             FROM steps 
             WHERE run_id = ? AND status = 'FAILED'
+              AND step_name NOT IN (SELECT step_name FROM steps WHERE run_id = ? AND status IN ('COMPLETED', 'PARTIAL_FAILURE'))
             ORDER BY step_order
-        """, (run_id,))
+        """, (run_id, run_id))
         
         results = []
         for row in cursor.fetchall():
@@ -310,25 +313,6 @@ class Checkpointer:
                 'output_data': json.loads(row[2]) if row[2] else None,
                 'error_message': row[3],
                 'completed_at': row[4]
-            })
-        return results
-    
-    def get_pending_steps(self, run_id: str) -> list[dict]:
-        """Get all steps that haven't been executed yet."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT step_name, step_order, input_data
-            FROM steps 
-            WHERE run_id = ? AND status = 'PENDING'
-            ORDER BY step_order
-        """, (run_id,))
-        
-        results = []
-        for row in cursor.fetchall():
-            results.append({
-                'step_name': row[0],
-                'step_order': row[1],
-                'input_data': json.loads(row[2]) if row[2] else None
             })
         return results
     
@@ -396,7 +380,7 @@ class Checkpointer:
             SELECT status, input_data, output_data, error_message
             FROM steps 
             WHERE run_id = ? AND step_name = ?
-            ORDER BY completed_at DESC
+            ORDER BY id DESC
             LIMIT 1
         """, (run_id, step_name))
         
@@ -516,7 +500,7 @@ class Checkpointer:
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
             run_id, event, sub_task, tx_id,
-            json.dumps(details) if details else None,
+            json.dumps(details, default=str) if details is not None else None,
             time.time()
         ))
         self.conn.commit()
@@ -584,5 +568,5 @@ class Checkpointer:
         """Ensure connection is closed on deletion."""
         try:
             self.close()
-        except:
+        except Exception:
             pass

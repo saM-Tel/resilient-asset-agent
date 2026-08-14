@@ -19,7 +19,6 @@ from stubs.services import (
     validate_consistency,
     write_db_correction,
     update_cache,
-    reset_service_state,
     ServiceConfig,
 )
 from agent.checkpointer import Checkpointer
@@ -378,8 +377,3 @@ def execute_update_cache(checkpointer: Checkpointer, run_id: str,
         )
         print(f"  [FAIL] update_cache: {error_msg}")
         return ToolResult(success=False, error=error_msg)
-
-
-def reset_all_state():
-    """Reset all mock service state. Call at start of each run."""
-    reset_service_state()

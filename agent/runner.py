@@ -48,74 +48,13 @@ class AssetSyncAgent:
         # Recovery state tracking (persists across iterations)
         self._force_health_check = False
         self._last_health_results = None
-        
-        # Define available tools and their descriptions for the LLM
-        self.tools = {
-            "fetch_location": {
-                "name": "fetch_location",
-                "description": "Fetch current asset location from the location service. Returns coordinates, status, and staleness info.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "asset_id": {
-                            "type": "string",
-                            "description": "The asset identifier to query"
-                        }
-                    },
-                    "required": ["asset_id"]
-                }
-            },
-            "validate_consistency": {
-                "name": "validate_consistency",
-                "description": "Validate data consistency between current asset state and expected target. Returns discrepancies if any.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "asset_data": {
-                            "type": "object",
-                            "description": "Current asset location data from fetch_location"
-                        }
-                    },
-                    "required": ["asset_data"]
-                }
-            },
-            "write_db_correction": {
-                "name": "write_db_correction",
-                "description": "Write corrections to the asset database. Use when discrepancies are found that need fixing.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "correction_data": {
-                            "type": "object",
-                            "description": "Data to write: lat, lng, status"
-                        }
-                    },
-                    "required": ["correction_data"]
-                }
-            },
-            "update_cache": {
-                "name": "update_cache",
-                "description": "Update the distributed cache with latest asset state. Should be called after successful DB write.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cache_data": {
-                            "type": "object",
-                            "description": "Data to cache"
-                        }
-                    },
-                    "required": ["cache_data"]
-                }
-            },
-            "check_system_health": {
-                "name": "check_system_health",
-                "description": "Check health status of all distributed services (location, database, cache). Use this when a step fails to diagnose which service is down before deciding next action.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        }
+    
+    def _get_latest_step_output(self, completed_steps: list[dict], step_name: str) -> Optional[dict]:
+        """Get output data of the latest completed step by name."""
+        for step in reversed(completed_steps):
+            if step.get("step_name") == step_name and step.get("output_data"):
+                return step["output_data"]
+        return None
     
     def get_execution_context(self) -> dict:
         """
@@ -276,7 +215,7 @@ Decide next action. Return JSON only."""
         # Absolute fallback
         return {
             "action": "fetch_location",
-            "reasoning": f"Failed to parse LLM response: {str(e) if 'e' in dir() else 'unknown'}",
+            "reasoning": "Failed to parse LLM response into valid JSON action",
             "parameters": {"asset_id": "asset_001"}
         }
     
@@ -292,6 +231,8 @@ Decide next action. Return JSON only."""
         Returns:
             Tuple of (success: bool, result: dict)
         """
+        parameters = parameters or {}
+        
         if action == "DONE":
             return True, {"message": "All steps completed"}
         
@@ -305,11 +246,7 @@ Decide next action. Return JSON only."""
         elif action == "validate_consistency":
             # Get latest location data from completed steps
             completed = self.checkpointer.get_completed_steps(self.run_id)
-            location_data = None
-            for step in completed:
-                if step["step_name"] == "fetch_location" and step["output_data"]:
-                    location_data = step["output_data"]
-                    break
+            location_data = self._get_latest_step_output(completed, "fetch_location")
             
             if not location_data:
                 return False, {"error": "No location data available - must fetch first"}
@@ -320,20 +257,24 @@ Decide next action. Return JSON only."""
         elif action == "write_db_correction":
             # Get location and validation data
             completed = self.checkpointer.get_completed_steps(self.run_id)
-            location_data = None
-            validation_data = None
-            
-            for step in completed:
-                if step["step_name"] == "fetch_location" and step["output_data"]:
-                    location_data = step["output_data"]
-                elif step["step_name"] == "validate_consistency" and step["output_data"]:
-                    validation_data = step["output_data"]
+            location_data = self._get_latest_step_output(completed, "fetch_location")
+            validation_data = self._get_latest_step_output(completed, "validate_consistency")
             
             if not location_data or not validation_data:
                 return False, {"error": "Need location and validation data first"}
             
             # Check if already synced
             if validation_data.get("is_synced"):
+                # Save checkpoint step so workflow knows this step is satisfied
+                self.checkpointer.save_step(
+                    run_id=self.run_id,
+                    step_name="write_db_correction",
+                    step_order=3,
+                    status="COMPLETED",
+                    input_data={"validation_data": validation_data},
+                    output_data={"message": "Asset already synced, no correction needed", "is_synced": True}
+                )
+                print("  [OK] write_db_correction: Asset already synced, marked completed")
                 return True, {"message": "Asset already synced, no correction needed"}
             
             # Build correction from discrepancies (expected values)
@@ -356,16 +297,14 @@ Decide next action. Return JSON only."""
             return result.success, result.to_dict()
         
         elif action == "update_cache":
-            # Get latest data for caching
+            # Get latest location data for caching
             completed = self.checkpointer.get_completed_steps(self.run_id)
-            location_data = None
+            location_data = self._get_latest_step_output(completed, "fetch_location")
             
-            for step in completed:
-                if step["step_name"] == "fetch_location" and step["output_data"]:
-                    location_data = step["output_data"]
-                    break
+            if not location_data:
+                return False, {"error": "No location data available - must fetch first"}
             
-            cache_data = location_data or {"status": "synced"}
+            cache_data = parameters.get("cache_data") or location_data
             
             result = execute_update_cache(self.checkpointer, self.run_id, cache_data)
             return result.success, result.to_dict()
@@ -558,18 +497,21 @@ Decide next action. Return JSON only."""
                 
                 # Execute the action
                 if action == "DONE":
-                    print("[OK] All steps completed successfully!")
-                    self.checkpointer.emit_event(
-                        self.run_id, "RUN_COMPLETED",
-                        details={"reason": "llm_signaled_done"}
-                    )
-                    self.checkpointer.complete_run(self.run_id)
-                    
-                    return {
-                        "status": "COMPLETED",
-                        "iterations": iteration,
-                        "summary": "Asset synchronization completed"
-                    }
+                    if self._force_health_check:
+                        print("[WARN] LLM signaled DONE while recovery health check is pending - continuing to health check")
+                    else:
+                        print("[OK] All steps completed successfully!")
+                        self.checkpointer.emit_event(
+                            self.run_id, "RUN_COMPLETED",
+                            details={"reason": "llm_signaled_done"}
+                        )
+                        self.checkpointer.complete_run(self.run_id)
+                        
+                        return {
+                            "status": "COMPLETED",
+                            "iterations": iteration,
+                            "summary": "Asset synchronization completed"
+                        }
                 
                 success, result = self.execute_action(action, parameters, reasoning)
                 
