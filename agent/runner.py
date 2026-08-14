@@ -45,65 +45,16 @@ class AssetSyncAgent:
         self.checkpointer = checkpointer
         self.run_id = run_id
         
-        # Define available tools and their descriptions for the LLM
-        self.tools = {
-            "fetch_location": {
-                "name": "fetch_location",
-                "description": "Fetch current asset location from the location service. Returns coordinates, status, and staleness info.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "asset_id": {
-                            "type": "string",
-                            "description": "The asset identifier to query"
-                        }
-                    },
-                    "required": ["asset_id"]
-                }
-            },
-            "validate_consistency": {
-                "name": "validate_consistency",
-                "description": "Validate data consistency between current asset state and expected target. Returns discrepancies if any.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "asset_data": {
-                            "type": "object",
-                            "description": "Current asset location data from fetch_location"
-                        }
-                    },
-                    "required": ["asset_data"]
-                }
-            },
-            "write_db_correction": {
-                "name": "write_db_correction",
-                "description": "Write corrections to the asset database. Use when discrepancies are found that need fixing.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "correction_data": {
-                            "type": "object",
-                            "description": "Data to write: lat, lng, status"
-                        }
-                    },
-                    "required": ["correction_data"]
-                }
-            },
-            "update_cache": {
-                "name": "update_cache",
-                "description": "Update the distributed cache with latest asset state. Should be called after successful DB write.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cache_data": {
-                            "type": "object",
-                            "description": "Data to cache"
-                        }
-                    },
-                    "required": ["cache_data"]
-                }
-            }
-        }
+        # Recovery state tracking (persists across iterations)
+        self._force_health_check = False
+        self._last_health_results = None
+    
+    def _get_latest_step_output(self, completed_steps: list[dict], step_name: str) -> Optional[dict]:
+        """Get output data of the latest completed step by name."""
+        for step in reversed(completed_steps):
+            if step.get("step_name") == step_name and step.get("output_data"):
+                return step["output_data"]
+        return None
     
     def get_execution_context(self) -> dict:
         """
@@ -115,6 +66,7 @@ class AssetSyncAgent:
         run_status = self.checkpointer.get_run_status(self.run_id)
         completed_steps = self.checkpointer.get_completed_steps(self.run_id)
         failed_steps = self.checkpointer.get_failed_steps(self.run_id)
+        partial_steps = self.checkpointer.get_partial_steps(self.run_id)
         execution_trace = self.checkpointer.get_execution_trace(self.run_id)
         
         return {
@@ -122,6 +74,7 @@ class AssetSyncAgent:
             "status": run_status["status"] if run_status else "UNKNOWN",
             "completed_steps": completed_steps,
             "failed_steps": failed_steps,
+            "partial_steps": partial_steps,
             "execution_trace": execution_trace
         }
     
@@ -145,33 +98,59 @@ class AssetSyncAgent:
 3. write_db_correction - write to database
 4. update_cache - update cache
 
+ADDITIONAL TOOL:
+- check_system_health - diagnose service status when steps fail
+
+FAILURE HANDLING RULES:
+- If ANY step fails, DO NOT retry it immediately. Your next action MUST be check_system_health.
+- CRITICAL HEALTH CHECK RULE: After calling check_system_health, if the returned health status shows a service is False/DOWN (e.g., {"cache": false}):
+  - DO NOT call 'check_system_health' again.
+  - DO NOT retry the failed step.
+  - You MUST output action "halt" with reasoning explaining: "[Service] service is reported as DOWN by health check. Pausing workflow until service recovers."
+- Only retry a failed step after health check confirms ALL services are HEALTHY (True).
+- PARTIAL FAILURE RULE: A step listed under "Partial" has ALREADY committed its write server-side (the response was just incomplete). DO NOT retry it - proceed to the NEXT step in the workflow.
+
 RULES:
-- Never repeat completed steps
+- Never repeat completed or partial steps
 - Return ONLY valid JSON: {"action": "...", "reasoning": "...", "parameters": {...}}
 - Use "DONE" when all steps complete
-- Be brief and respond immediately
-- If unsure, choose fetch_location"""
+- Be brief and respond immediately"""
         
         # Build execution history summary (brief format)
         completed_names = [s["step_name"] for s in context["completed_steps"]]
         failed_names = [s["step_name"] for s in context["failed_steps"]]
+        partial_names = [s["step_name"] for s in context.get("partial_steps", [])]
         
         user_message = f"""Completed: {completed_names}
 Failed: {failed_names}
+Partial (already committed, do NOT retry): {partial_names}
 
 Decide next action. Return JSON only."""
+        
+        # If force_health_check is set, add explicit instruction
+        if self._force_health_check:
+            user_message += "\n\n[IMPORTANT] A step just failed. Your next action MUST be check_system_health to diagnose service status."
+        
+        # If we have health check results from a previous iteration, inject them so LLM can act on them
+        if self._last_health_results is not None:
+            health = self._last_health_results
+            down_services = [svc for svc, healthy in health.items() if not healthy]
+            user_message += f"\n\n[HEALTH CHECK RESULTS] {health}"
+            if down_services:
+                user_message += f"\n[CRITICAL] Services DOWN: {', '.join(down_services)}. Per failure handling rules, you MUST output action 'halt' - do NOT call check_system_health again."
         
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ]
     
-    def parse_llm_response(self, response_content: str) -> dict:
+    def parse_llm_response(self, response_content: str, context: dict = None) -> dict:
         """
         Parse the LLM's JSON response into a decision.
         
         Args:
             response_content: Raw text from LLM response
+            context: Optional execution context for smarter fallback
             
         Returns:
             Dictionary with action, reasoning, and parameters
@@ -181,49 +160,79 @@ Decide next action. Return JSON only."""
         
         # Handle empty response
         if not content:
-            print("[WARN] LLM returned empty response, requesting asset fetch")
+            print("[WARN] LLM returned empty response")
             return {
                 "action": "fetch_location",
                 "reasoning": "Empty response from LLM, starting with location fetch",
                 "parameters": {"asset_id": "asset_001"}
             }
         
-        # Try to extract JSON from response (handle markdown code blocks)
-        if "```" in content:
-            # Extract JSON from code block (handles ```json, ```python, etc.)
-            start = content.find("```") + 3
-            # Skip language identifier (e.g., "json", "python")
-            first_line_end = content.find("\n", start)
-            if first_line_end != -1:
-                start = first_line_end + 1
-            
-            end = content.rfind("```")
-            content = content[start:end].strip()
+        # Try to extract JSON from markdown code blocks if present
+        if content.startswith("```"):
+            # Find the closing backticks
+            end = content.find("```", 3)
+            if end != -1:
+                # Extract everything between opening and closing markers
+                inner = content[3:end].strip()
+                # Skip language identifier line (e.g., "json" or "python")
+                first_newline = inner.find("\n")
+                if first_newline != -1:
+                    content = inner[first_newline + 1:].strip()
+                else:
+                    content = inner
         
-        # Try to parse JSON
+        # Try to parse JSON directly
         try:
-            return json.loads(content)
+            parsed = json.loads(content)
+            # Validate it has at least an action field
+            if isinstance(parsed, dict) and "action" in parsed:
+                return parsed
         except json.JSONDecodeError as e:
             print(f"[WARN] Failed to parse JSON: {e}")
-            print(f"[WARN] Response content: {content[:100]}...")
-            # Fallback to fetch_location on parse failure
-            return {
-                "action": "fetch_location",
-                "reasoning": f"Failed to parse LLM response: {str(e)}",
-                "parameters": {"asset_id": "asset_001"}
-            }
+        
+        # If parsing failed, try to find a JSON object within the response
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            json_str = content[start:end + 1]
+            try:
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict) and "action" in parsed:
+                    return parsed
+            except json.JSONDecodeError as e2:
+                print(f"[WARN] Extracted JSON also failed to parse: {e2}")
+        
+        # Ultimate fallback - pick a better default based on what's already completed
+        if context:
+            completed_names = [s["step_name"] for s in context.get("completed_steps", [])]
+            if "update_cache" not in completed_names and "write_db_correction" not in completed_names:
+                return {"action": "fetch_location", "reasoning": "Parse failed, starting fresh", "parameters": {"asset_id": "asset_001"}}
+            elif "validate_consistency" not in completed_names:
+                return {"action": "validate_consistency", "reasoning": "Parse failed, next step is validation", "parameters": {}}
+            elif "write_db_correction" not in completed_names:
+                return {"action": "write_db_correction", "reasoning": "Parse failed, next step is DB write", "parameters": {}}
+        
+        # Absolute fallback
+        return {
+            "action": "fetch_location",
+            "reasoning": "Failed to parse LLM response into valid JSON action",
+            "parameters": {"asset_id": "asset_001"}
+        }
     
-    def execute_action(self, action: str, parameters: dict = None) -> tuple[bool, dict]:
+    def execute_action(self, action: str, parameters: dict = None, reasoning: str = "") -> tuple[bool, dict]:
         """
         Execute the LLM's chosen action through the appropriate tool.
         
         Args:
             action: Tool name to execute
             parameters: Parameters for the tool call
+            reasoning: Optional reasoning from the LLM (used for halt/stop actions)
             
         Returns:
             Tuple of (success: bool, result: dict)
         """
+        parameters = parameters or {}
+        
         if action == "DONE":
             return True, {"message": "All steps completed"}
         
@@ -237,11 +246,7 @@ Decide next action. Return JSON only."""
         elif action == "validate_consistency":
             # Get latest location data from completed steps
             completed = self.checkpointer.get_completed_steps(self.run_id)
-            location_data = None
-            for step in completed:
-                if step["step_name"] == "fetch_location" and step["output_data"]:
-                    location_data = step["output_data"]
-                    break
+            location_data = self._get_latest_step_output(completed, "fetch_location")
             
             if not location_data:
                 return False, {"error": "No location data available - must fetch first"}
@@ -252,20 +257,24 @@ Decide next action. Return JSON only."""
         elif action == "write_db_correction":
             # Get location and validation data
             completed = self.checkpointer.get_completed_steps(self.run_id)
-            location_data = None
-            validation_data = None
-            
-            for step in completed:
-                if step["step_name"] == "fetch_location" and step["output_data"]:
-                    location_data = step["output_data"]
-                elif step["step_name"] == "validate_consistency" and step["output_data"]:
-                    validation_data = step["output_data"]
+            location_data = self._get_latest_step_output(completed, "fetch_location")
+            validation_data = self._get_latest_step_output(completed, "validate_consistency")
             
             if not location_data or not validation_data:
                 return False, {"error": "Need location and validation data first"}
             
             # Check if already synced
             if validation_data.get("is_synced"):
+                # Save checkpoint step so workflow knows this step is satisfied
+                self.checkpointer.save_step(
+                    run_id=self.run_id,
+                    step_name="write_db_correction",
+                    step_order=3,
+                    status="COMPLETED",
+                    input_data={"validation_data": validation_data},
+                    output_data={"message": "Asset already synced, no correction needed", "is_synced": True}
+                )
+                print("  [OK] write_db_correction: Asset already synced, marked completed")
                 return True, {"message": "Asset already synced, no correction needed"}
             
             # Build correction from discrepancies (expected values)
@@ -288,19 +297,31 @@ Decide next action. Return JSON only."""
             return result.success, result.to_dict()
         
         elif action == "update_cache":
-            # Get latest data for caching
+            # Get latest location data for caching
             completed = self.checkpointer.get_completed_steps(self.run_id)
-            location_data = None
+            location_data = self._get_latest_step_output(completed, "fetch_location")
             
-            for step in completed:
-                if step["step_name"] == "fetch_location" and step["output_data"]:
-                    location_data = step["output_data"]
-                    break
+            if not location_data:
+                return False, {"error": "No location data available - must fetch first"}
             
-            cache_data = location_data or {"status": "synced"}
+            cache_data = parameters.get("cache_data") or location_data
             
             result = execute_update_cache(self.checkpointer, self.run_id, cache_data)
             return result.success, result.to_dict()
+        
+        elif action == "check_system_health":
+            from stubs.services import check_service_health
+            health = check_service_health()
+            print(f"  [OK] check_system_health: {health}")
+            # Store results in instance variable so LLM sees them next iteration
+            self._last_health_results = health
+            return True, {"health_status": health}
+        
+        elif action in ["halt", "stop"]:
+            # Agent has decided to halt due to service unavailability
+            print(f"[INFO] Workflow halted by agent: {reasoning}")
+            self.checkpointer.complete_run(self.run_id)  # Mark as completed (intelligently halted)
+            return True, {"message": f"Workflow halted - {reasoning}"}
         
         else:
             return False, {"error": f"Unknown action: {action}"}
@@ -312,13 +333,30 @@ Decide next action. Return JSON only."""
         Returns:
             Dictionary with final execution summary
         """
-        MAX_ITERATIONS = 10
+        MAX_ITERATIONS = 15
         iteration = 0
         empty_responses = 0  # Track consecutive empty responses
+        last_failed_action = None  # Track the most recent failed action for intelligent recovery
         
         print(f"\n{'='*60}")
         print(f"Starting Asset Sync Agent - Run ID: {self.run_id}")
         print(f"{'='*60}\n")
+        
+        # Ensure run record exists in the runs table (create it if missing)
+        existing_run = self.checkpointer.get_run_status(self.run_id)
+        if not existing_run:
+            print(f"[INFO] Creating new run '{self.run_id}'")
+            self.checkpointer.create_run(self.run_id)
+        elif existing_run["status"] != "IN_PROGRESS":
+            # Re-running a completed/failed run - clear previous data for clean slate
+            print(f"[INFO] Re-running with existing ID '{self.run_id}' - clearing previous data")
+            self.checkpointer.clear_run(self.run_id)
+        
+        # Emit run-started event to the audit trail (Upgrade 2)
+        self.checkpointer.emit_event(
+            self.run_id, "RUN_STARTED",
+            details={"max_iterations": MAX_ITERATIONS}
+        )
         
         while iteration < MAX_ITERATIONS:
             iteration += 1
@@ -327,25 +365,91 @@ Decide next action. Return JSON only."""
             # Get current state
             context = self.get_execution_context()
             
-            # Check if all required steps are completed - auto-complete if so
-            completed_step_names = set(s["step_name"] for s in context["completed_steps"])
-            required_steps = {"fetch_location", "validate_consistency", "write_db_correction", "update_cache"}
+            # Check if all required steps are completed - auto-complete if so.
+            # A step in PARTIAL_FAILURE counts as "done" for progression: the
+            # mutation likely committed server-side, so re-executing would be a
+            # duplicate write. We proceed to the next step instead.
+            #
+            # IMPORTANT: We only auto-complete when NO failure is pending
+            # reconciliation. If a step just failed (e.g. cache timeout ->
+            # UNKNOWN), we must run the health check / halt logic first rather
+            # than declaring success over an indeterminate state.
+            if not self._force_health_check:
+                completed_step_names = set(s["step_name"] for s in context["completed_steps"])
+                partial_step_names = set(s["step_name"] for s in context["partial_steps"])
+                done_step_names = completed_step_names | partial_step_names
+                required_steps = {"fetch_location", "validate_consistency", "write_db_correction", "update_cache"}
+                
+                if required_steps.issubset(done_step_names):
+                    print("[OK] All required steps completed! Auto-completing workflow.")
+                    self.checkpointer.emit_event(
+                        self.run_id, "RUN_COMPLETED",
+                        details={"reason": "all_steps_completed"}
+                    )
+                    self.checkpointer.complete_run(self.run_id)
+                    return {
+                        "status": "COMPLETED",
+                        "iterations": iteration,
+                        "summary": "Asset synchronization completed (auto-detected)"
+                    }
             
-            if required_steps.issubset(completed_step_names):
-                print("[OK] All required steps completed! Auto-completing workflow.")
-                self.checkpointer.complete_run(self.run_id)
-                return {
-                    "status": "COMPLETED",
-                    "iterations": iteration,
-                    "summary": "Asset synchronization completed (auto-detected)"
-                }
+            # INTELLIGENT RECOVERY: If a step just failed, force check_system_health
+            if self._force_health_check:
+                print("[INFO] Step failed - forcing intelligent recovery via health check\n")
+                
+                # Emit reconciliation event to the audit trail (Upgrade 2)
+                self.checkpointer.emit_event(
+                    self.run_id, "RECONCILIATION_STARTED",
+                    sub_task=last_failed_action,
+                    details={"trigger": "step_failure", "action": "check_system_health"}
+                )
+                
+                # Execute health check directly (no LLM needed)
+                from stubs.services import check_service_health
+                health = check_service_health()
+                print(f"  [OK] check_system_health: {health}")
+                
+                # Log the decision
+                self.checkpointer.save_decision(
+                    run_id=self.run_id,
+                    step_name=f"iteration_{iteration}",
+                    reasoning=f"{last_failed_action} failed. Calling health check to diagnose.",
+                    next_action="check_system_health"
+                )
+                
+                # Store health results in instance variable so LLM can see them next iteration
+                self._last_health_results = health
+                
+                # If any service is DOWN, halt immediately - no need for LLM
+                down_services = [svc for svc, healthy in health.items() if not healthy]
+                if down_services:
+                    print(f"[INFO] Services DOWN: {', '.join(down_services)}")
+                    print(f"[INFO] Workflow halted by agent - service recovery required\n")
+                    
+                    # Emit halt event to the audit trail (Upgrade 2)
+                    self.checkpointer.emit_event(
+                        self.run_id, "WORKFLOW_HALTED",
+                        details={"down_services": down_services,
+                                 "reason": "service_unavailable"}
+                    )
+                    self.checkpointer.complete_run(self.run_id)
+                    return {
+                        "status": "COMPLETED",  # Intelligently halted, not failed
+                        "iterations": iteration,
+                        "summary": f"Workflow halted - services unavailable: {', '.join(down_services)}"
+                    }
+                
+                # All services healthy - clear flag and continue to next iteration
+                self._force_health_check = False
+                last_failed_action = None
+                continue
             
             # Build and send prompt to LLM
             messages = self.build_llm_prompt(context)
             
             try:
                 response = self.client.chat.completions.create(
-                    model="qwen3.6-35b",
+                    model="qwen3.8-27b",
                     messages=messages,
                     temperature=0.1,
                     max_tokens=200,  # Shorter responses minimize thinking mode
@@ -374,8 +478,8 @@ Decide next action. Return JSON only."""
                             response_content = '{"action": "update_cache", "reasoning": "Final step: update cache", "parameters": {}}'
                         empty_responses = 0
                 
-                # Parse decision
-                decision = self.parse_llm_response(response_content)
+                # Parse decision - pass context so fallback can pick a better default
+                decision = self.parse_llm_response(response_content, context)
                 action = decision.get("action", "UNKNOWN")
                 reasoning = decision.get("reasoning", "")
                 parameters = decision.get("parameters", {})
@@ -393,23 +497,52 @@ Decide next action. Return JSON only."""
                 
                 # Execute the action
                 if action == "DONE":
-                    print("[OK] All steps completed successfully!")
-                    self.checkpointer.complete_run(self.run_id)
-                    
-                    return {
-                        "status": "COMPLETED",
-                        "iterations": iteration,
-                        "summary": "Asset synchronization completed"
-                    }
+                    if self._force_health_check:
+                        print("[WARN] LLM signaled DONE while recovery health check is pending - continuing to health check")
+                    else:
+                        print("[OK] All steps completed successfully!")
+                        self.checkpointer.emit_event(
+                            self.run_id, "RUN_COMPLETED",
+                            details={"reason": "llm_signaled_done"}
+                        )
+                        self.checkpointer.complete_run(self.run_id)
+                        
+                        return {
+                            "status": "COMPLETED",
+                            "iterations": iteration,
+                            "summary": "Asset synchronization completed"
+                        }
                 
-                success, result = self.execute_action(action, parameters)
+                success, result = self.execute_action(action, parameters, reasoning)
                 
                 if not success:
-                    print(f"[WARN] Action failed: {result.get('error', 'Unknown error')}")
+                    print(f"[FAIL] {action}: {result.get('error', 'Unknown error')}")
                     
-                    # If we keep failing the same action, try recovery
+                    # Surface granular sub-task status (Upgrade 1)
+                    # A timeout is not a hard failure - the sub-task may be UNKNOWN
+                    # (the write might have committed server-side).
+                    sub_tasks = self.checkpointer.get_sub_tasks(self.run_id, action)
+                    if sub_tasks:
+                        print(f"  [SUBTASKS] {action}:")
+                        for st in sub_tasks:
+                            marker = {"SUCCESS": "OK", "FAILED": "FAIL",
+                                      "UNKNOWN": "UNKNOWN"}.get(st["status"], st["status"])
+                            tx = f" (tx={st['tx_id']})" if st.get("tx_id") else ""
+                            print(f"    - {st['sub_task_name']}: [{marker}]{tx}")
+                    
+                    # Track the failed action for intelligent recovery
+                    last_failed_action = action
+                    
+                    # Force check_system_health on next iteration instead of blind retry
+                    self._force_health_check = True
+                    
+                    # If we keep failing the same action after health check, mark as FAILED
                     if iteration >= MAX_ITERATIONS - 1:
                         print("[WARN] Approaching max iterations - marking run as FAILED")
+                        self.checkpointer.emit_event(
+                            self.run_id, "RUN_FAILED",
+                            details={"reason": "max_iterations", "failed_action": action}
+                        )
                         self.checkpointer.fail_run(self.run_id, "Max iterations reached")
                         return {
                             "status": "FAILED",
@@ -419,6 +552,10 @@ Decide next action. Return JSON only."""
                 
             except Exception as e:
                 print(f"[ERROR] Error in execution loop: {e}")
+                self.checkpointer.emit_event(
+                    self.run_id, "RUN_FAILED",
+                    details={"reason": "exception", "error": str(e)}
+                )
                 self.checkpointer.fail_run(self.run_id, str(e))
                 return {
                     "status": "ERROR",
@@ -428,6 +565,10 @@ Decide next action. Return JSON only."""
         
         # Max iterations reached
         print(f"\n[WARN] Reached max iterations ({MAX_ITERATIONS})")
+        self.checkpointer.emit_event(
+            self.run_id, "RUN_FAILED",
+            details={"reason": "max_iterations_exceeded"}
+        )
         self.checkpointer.fail_run(self.run_id, "Max iterations exceeded")
         return {
             "status": "FAILED",

@@ -21,8 +21,15 @@ class LocationServiceError(Exception):
     pass
 
 
-class CacheSyncFailure(Exception):
-    """Exception raised when cache update fails but DB write succeeded."""
+class CacheSyncFailure(TimeoutError):
+    """
+    Exception raised when a cache update fails (timeout or unavailability).
+    
+    Subclasses TimeoutError because, in distributed systems, a cache write
+    that times out has an UNKNOWN outcome - the write may have committed
+    server-side but the response was lost. Callers should treat this as
+    UNKNOWN (not a hard FAILED) so reconciliation can verify the true state.
+    """
     pass
 
 
@@ -40,6 +47,11 @@ _service_state = {
     "expected_state": {"lat": 51.5074, "lng": -0.1278, "status": "synced"},  # Target: London
     "db_written": False,
     "cache_updated": False,
+    # Idempotency registry (Upgrade 3): maps idempotency_key -> original result.
+    # When a mutation is retried with a key we've already seen, we replay the
+    # original result instead of re-executing - exactly how real idempotency
+    # keys prevent duplicate side-effects on retry.
+    "idempotency_registry": {},
 }
 
 
@@ -75,7 +87,27 @@ def reset_service_state():
         "expected_state": {"lat": 51.5074, "lng": -0.1278, "status": "synced"},
         "db_written": False,
         "cache_updated": False,
+        "idempotency_registry": {},
     }
+
+
+def _check_idempotency(idempotency_key: str = None):
+    """
+    Check the idempotency registry for a previously-seen key (Upgrade 3).
+    
+    Returns the original result dict if this key was already processed,
+    or None if the key is new. This lets a retried mutation replay its
+    original outcome instead of re-executing (preventing duplicate writes).
+    """
+    if idempotency_key and idempotency_key in _service_state["idempotency_registry"]:
+        return _service_state["idempotency_registry"][idempotency_key]
+    return None
+
+
+def _record_idempotency(idempotency_key: str, result: dict) -> None:
+    """Record a mutation result under its idempotency key (Upgrade 3)."""
+    if idempotency_key:
+        _service_state["idempotency_registry"][idempotency_key] = result
 
 
 # =============================================================================
@@ -195,7 +227,8 @@ def validate_consistency(asset_data: dict, expected_state: dict = None) -> dict[
 # Asset Database (Write Layer)
 # =============================================================================
 
-def write_db_correction(asset_id: str, correction_data: dict) -> dict[str, Any]:
+def write_db_correction(asset_id: str, correction_data: dict, 
+                        idempotency_key: str = None) -> dict[str, Any]:
     """
     Write corrections to the asset database.
     
@@ -205,6 +238,7 @@ def write_db_correction(asset_id: str, correction_data: dict) -> dict[str, Any]:
     Args:
         asset_id: Asset identifier
         correction_data: Data to write (lat, lng, status)
+        idempotency_key: Unique key for mutation deduplication (Upgrade 3)
         
     Returns:
         Dictionary with transaction ID and confirmation
@@ -214,17 +248,25 @@ def write_db_correction(asset_id: str, correction_data: dict) -> dict[str, Any]:
     """
     config = ServiceConfig
     
+    # Idempotency check (Upgrade 3): replay original result if key already seen
+    replayed = _check_idempotency(idempotency_key)
+    if replayed is not None:
+        return replayed
+    
     # Simulate write delay
     time.sleep(config.write_delay)
     
     if config.partial_write:
         # Write succeeds but returns incomplete response (simulates partial write)
         _service_state["db_written"] = True
-        return {
-            "tx_id": f"tx_{int(time.time())}",
+        result = {
+            "tx_id": f"tx_{int(time.time() * 1000)}",
             "status": "partial",  # Incomplete response!
-            "message": "Write completed with warnings"
+            "message": "Write completed with warnings",
+            "idempotency_key": idempotency_key
         }
+        _record_idempotency(idempotency_key, result)
+        return result
     
     # Normal successful write
     _service_state["db_written"] = True
@@ -232,18 +274,22 @@ def write_db_correction(asset_id: str, correction_data: dict) -> dict[str, Any]:
     _service_state["asset_location"]["lng"] = correction_data.get("lng")
     _service_state["asset_location"]["status"] = correction_data.get("status", "synced")
     
-    return {
-        "tx_id": f"tx_{int(time.time())}",
+    result = {
+        "tx_id": f"tx_{int(time.time() * 1000)}",
         "status": "completed",
-        "message": "Database write successful"
+        "message": "Database write successful",
+        "idempotency_key": idempotency_key
     }
+    _record_idempotency(idempotency_key, result)
+    return result
 
 
 # =============================================================================
 # Cache Service (Fast Layer)
 # =============================================================================
 
-def update_cache(asset_id: str, cache_data: dict) -> dict[str, Any]:
+def update_cache(asset_id: str, cache_data: dict, 
+                 idempotency_key: str = None) -> dict[str, Any]:
     """
     Update the distributed cache with latest asset state.
     
@@ -254,6 +300,7 @@ def update_cache(asset_id: str, cache_data: dict) -> dict[str, Any]:
     Args:
         asset_id: Asset identifier
         cache_data: Data to cache
+        idempotency_key: Unique key for mutation deduplication (Upgrade 3)
         
     Returns:
         Dictionary with cache update confirmation
@@ -262,6 +309,11 @@ def update_cache(asset_id: str, cache_data: dict) -> dict[str, Any]:
         CacheSyncFailure: On timeout or service unavailability
     """
     config = ServiceConfig
+    
+    # Idempotency check (Upgrade 3): replay original result if key already seen
+    replayed = _check_idempotency(idempotency_key)
+    if replayed is not None:
+        return replayed
     
     # Simulate network latency for cache (typically faster than DB)
     if config.enable_latency and not (config.cache_timeout or config.cache_unavailable):
@@ -278,12 +330,16 @@ def update_cache(asset_id: str, cache_data: dict) -> dict[str, Any]:
     # Successful cache update
     _service_state["cache_updated"] = True
     
-    return {
+    result = {
         "status": "SUCCESS",
         "cached_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "asset_id": asset_id,
-        "ttl_seconds": 3600
+        "ttl_seconds": 3600,
+        "tx_id": f"tx_{int(time.time() * 1000)}",
+        "idempotency_key": idempotency_key
     }
+    _record_idempotency(idempotency_key, result)
+    return result
 
 
 # =============================================================================
