@@ -510,7 +510,7 @@ Decide next action. Return JSON only."""
             
             try:
                 response = self.client.chat.completions.create(
-                    model="qwen3.6-35b",
+                    model="qwen3.8-27b",
                     messages=messages,
                     temperature=0.1,
                     max_tokens=200,  # Shorter responses minimize thinking mode

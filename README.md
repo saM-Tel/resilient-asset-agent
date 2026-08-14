@@ -57,7 +57,7 @@ graph TD
 
 ### Prerequisites
 - Python 3.10+
-- Local LLM server running on `localhost:8000` (e.g., `llama-server.exe`, LM Studio, vLLM) with model `qwen3.6-35b`
+- Local LLM server running on `localhost:8000` (e.g., `llama-server.exe`, LM Studio, vLLM) with model `qwen3.8-27b`
 
 ### Installation
 
@@ -195,3 +195,35 @@ resilient-asset-agent/
 ## License
 
 MIT
+
+---
+
+## Development History
+
+### Bugs Encountered & Fixed
+
+| Bug | Root Cause | Solution |
+|-----|-----------|----------|
+| JSON Parse Errors | Markdown code blocks in LLM response (` ```json `) | Strip delimiters, skip language identifiers, add fallback action |
+| Empty LLM Responses | Extended thinking mode returning nothing | Simplified prompt, max_tokens=200, timeout=10s, force-progress after 2 empty responses |
+| Windows Encoding | Emoji characters (❌✅⏭️) not supported in PowerShell | Replaced with text markers: `[FAIL]`, `[OK]`, `[SKIP]` |
+| Duplicate Execution | No idempotency check before tool calls | Pre-execution checkpoint guard in all tool wrappers |
+| Connection Hangs | No timeout on LLM API calls | Added `timeout=10` and MAX_ITERATIONS limit (10) |
+
+See [BUGS_AND_FIXES.md](BUGS_AND_FIXES.md) for detailed analysis of each fix.
+
+### Implementation Phases
+
+- **Phase 1**: Foundation — services, checkpointer, tools, runner, CLI entry point
+- **Phase 2**: Basic Testing — LLM connection, mock services, checkpoint persistence
+- **Phase 3**: Debug & Refinement — 6 bugs fixed (see above)
+- **Phase 4**: Testing & Validation — normal workflow, failure recovery, idempotency verified
+- **Phase 5**: Documentation & Visualizer — README, debug dashboard
+
+### Lessons Learned
+
+1. **LLM Response Robustness**: Always handle markdown code blocks and provide fallback parsing
+2. **Timeout Everything**: External service calls must have timeouts to prevent indefinite hangs
+3. **Idempotency First**: Check state before executing; persist atomically after execution
+4. **Clear Logging**: Text-based status markers (`[SKIP]`, `[EXECUTE]`, `[OK]`, `[FAIL]`) aid debugging and demos
+5. **Platform Compatibility**: Avoid emoji/special characters for cross-terminal compatibility

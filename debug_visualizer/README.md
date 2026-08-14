@@ -13,117 +13,111 @@ A real-time web-based dashboard for monitoring and debugging the Resilient Asset
 
 ## Quick Start
 
-### 1. Install Dependencies
-```bash
-pip install -r debug_visualizer/requirements.txt
+### Option 1: Use the Launcher (Easiest)
+
+**PowerShell:**
+```powershell
+.\debug_visualizer\run.ps1
 ```
 
-### 2. Start the Visualizer
+**Command Prompt:**
+```cmd
+debug_visualizer\run.bat
+```
+
+This activates your venv, installs Flask if needed, and starts the dashboard on http://localhost:5000.
+
+### Option 2: Manual Start
+
 ```bash
+# Activate venv
+.\venv\Scripts\Activate.ps1
+
+# Install dependencies
+pip install -r debug_visualizer/requirements.txt
+
+# Start visualizer
 python debug_visualizer/server.py
 ```
 
-### 3. Open in Browser
-Go to: **http://localhost:5000**
-
-The dashboard will auto-refresh every second and show:
-- Current run status
-- All execution steps
-- LLM decisions and reasoning
-- Recent run history
-
-### 4. Run Agent (in another terminal)
-While the visualizer is running, start the agent:
-
-```bash
-python main.py --run-id demo-debug
-```
-
-You'll see the dashboard update in real-time as the agent executes!
+Then open **http://localhost:5000** in your browser.
 
 ## Dashboard Sections
 
-### 📌 Sidebar - Recent Runs
-- Shows last 20 runs
-- Click any run to view its details
-- Color-coded status indicators
-
-### 🔍 Run Info
+### � Run Info (Header)
 - Current status (COMPLETED, FAILED, PENDING)
-- Steps completed count
-- Run creation timestamp
+- Steps completed count (e.g., 4/4)
+- Current cycle / iteration number
+- Total LLM decisions made
 
 ### 📋 Execution Steps
 Each step card shows:
 - Step name and timestamp
 - Status badge (color-coded)
+- Input data (formatted JSON)
 - Output data (formatted JSON)
-- Error details (if any)
+- Error details (if any, shown in red)
 
-**Step Status Colors**:
+**Step Status Colors:**
 - 🟢 Green = COMPLETED
 - 🔴 Red = FAILED
 - 🟡 Yellow = PENDING
 
 ### 💭 LLM Decisions
 Each decision card shows:
-- Iteration number
+- Iteration number (`[CYCLE N]`)
 - Action chosen by LLM
-- Reasoning/explanation
+- Reasoning/explanation (the "WHY")
 - Timestamp
 
-## Example Workflow
+## Example Workflow — Failure & Recovery Demo
 
-1. **Terminal 1 - Start Visualizer**:
-```bash
-python debug_visualizer/server.py
-```
+1. **Terminal 1 - Start Visualizer:**
+   ```bash
+   python debug_visualizer/server.py
+   ```
 
-2. **Terminal 2 - Run Agent with Failure Injection**:
-```bash
-python main.py --run-id demo-fail --fail-at cache_update
-```
+2. **Terminal 2 - Run Agent with Failure Injection:**
+   ```bash
+   python main.py --run-id demo-fail --fail-at cache_update
+   ```
+   Watch: Steps 1-3 complete, Step 4 fails (cache timeout).
 
-3. **Browser - Watch in Real-time**:
-Open http://localhost:5000 and watch:
-- Step 1 (fetch_location) → COMPLETED ✓
-- Step 2 (validate_consistency) → COMPLETED ✓
-- Step 3 (write_db_correction) → COMPLETED ✓
-- Step 4 (update_cache) → FAILED ✗
+3. **Terminal 2 - Retry Same Run (still failing):**
+   ```bash
+   python main.py --run-id demo-fail --fail-at cache_update
+   ```
+   Watch: Steps 1-3 are SKIPPED (cached), Step 4 fails again.
 
-4. **Terminal 2 - Retry Same Run**:
-```bash
-python main.py --run-id demo-fail --fail-at cache_update
-```
+4. **Terminal 2 - Remove Failure Injection:**
+   ```bash
+   python main.py --run-id demo-fail
+   ```
+   Watch: Steps 1-3 skipped, Step 4 completes → Status: COMPLETED ✅
 
-5. **Browser - See Recovery**:
-- Steps 1-3 → SKIPPED (using cached results)
-- Step 4 → FAILED again (still injecting failure)
-
-6. **Terminal 2 - Remove Failure Injection**:
-```bash
-python main.py --run-id demo-fail
-```
-
-7. **Browser - See Completion**:
-- Steps 1-3 → SKIPPED
-- Step 4 (update_cache) → COMPLETED ✓
-- Overall Status → COMPLETED ✓
-
-This demonstrates **idempotent execution and intelligent failure recovery**!
+This demonstrates **idempotent execution and intelligent failure recovery**.
 
 ## How It Works
 
 The visualizer reads from the SQLite checkpoint database (`agent_state.db`) that the agent maintains:
 
-1. **Connects to SQLite** - Reads run, step, and decision records
-2. **Formats Data** - Converts raw DB rows to readable JSON
-3. **Serves Dashboard** - Flask app serves HTML + live API endpoints
-4. **Auto-Refresh** - JavaScript polls every 1 second for updates
+```
+┌──────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  Agent Run   │────▶│  agent_state.db  │────▶│ Flask Dashboard │
+│ (main.py)    │     │  (SQLite)        │     │ (:5000)         │
+└──────────────┘     └──────────────────┘     └─────────────────┘
+                       Tables:
+                         - runs (run_id, status, created_at, completed_at)
+                         - steps (id, run_id, step_name, status, input_data, output_data, error_message, started_at, completed_at)
+                         - decisions (id, run_id, step_name, reasoning, next_action, timestamp)
+```
+
+1. **Connects to SQLite** — Reads run, step, and decision records
+2. **Formats Data** — Converts raw DB rows to readable JSON
+3. **Serves Dashboard** — Flask app serves HTML + live API endpoints
+4. **Auto-Refresh** — JavaScript polls every 1 second for updates
 
 ## API Endpoints
-
-If you want to integrate this with other tools:
 
 ```bash
 # Get all runs
@@ -134,30 +128,43 @@ curl http://localhost:5000/api/run/demo-fail
 
 # Get most recent run
 curl http://localhost:5000/api/current
+
+# Database statistics (debug)
+curl http://localhost:5000/api/debug
 ```
 
 ## Troubleshooting
 
-### Port Already in Use
-If port 5000 is busy, modify `server.py`:
-```python
-app.run(debug=False, host="localhost", port=5001)  # Change to 5001
-```
+| Problem | Solution |
+|---------|----------|
+| Port 5000 already in use | Edit `server.py`: change `port=5000` to another port |
+| Blank "Loading..." screen | Run the agent at least once (`python main.py --run-id test-001`) so `agent_state.db` exists |
+| No data showing | Check browser console (F12), verify Flask is running, confirm DB file exists |
+| ModuleNotFoundError: flask | `pip install -r debug_visualizer/requirements.txt` |
 
-### Database Not Found
-Make sure `agent_state.db` exists in the project root. Run the agent at least once to create it.
+## What Was Fixed (Known Issues Resolved)
 
-### Blank Dashboard
-- Check if agent has run yet (look for db file)
-- Check browser console for errors (F12)
-- Make sure Flask is running (check terminal output)
+The initial visualizer showed "Loading..." forever because it used wrong column names. All issues are now resolved:
+
+- ❌ Used `created_at` → ✅ Changed to `started_at` for steps table
+- ❌ Used `error` → ✅ Changed to `error_message` (actual column name)
+- ❌ Used `updated_at` → ✅ Changed to `completed_at` for steps table
+- ✅ All SQL queries now use correct schema
+- ✅ JSON parsing works for input/output data
+- ✅ Dashboard shows real data in real-time
 
 ## Files
 
-- `server.py` - Flask server with embedded HTML dashboard
-- `requirements.txt` - Python dependencies (just Flask)
-- `README.md` - This file
+```
+debug_visualizer/
+├── server.py              # Flask server with embedded HTML dashboard (FIXED)
+├── __init__.py            # Python package marker
+├── requirements.txt       # Dependencies: Flask==2.3.0, Werkzeug==2.3.0
+├── run.bat                # Windows batch launcher
+├── run.ps1                # PowerShell launcher
+└── README.md              # This file
+```
 
 ---
 
-**Pro Tip**: Have the visualizer and agent running side-by-side for the ultimate debugging experience! 🚀
+**Pro Tip**: Open the visualizer and agent side-by-side — terminal on left, browser on right — for real-time debugging.
