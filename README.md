@@ -165,10 +165,14 @@ pip install pytest
 pytest tests/ -v
 ```
 
-**Current coverage (7 tests):**
+**Current coverage (11 tests):**
 
 | Test | Verifies |
 |------|----------|
+| `test_checkpointer_failed_steps_dedup` | Failed steps excluded when later retried successfully |
+| `test_already_synced_checkpoint` | Already-synced assets save a COMPLETED step for auto-complete |
+| `test_unique_tx_ids` | Millisecond-precision tx_id generation prevents collisions |
+| `test_none_parameters_safety` | Tool wrappers handle None parameters without crashing |
 | `test_idempotency_guard_prevents_duplicate_writes` | Completed sub-task recorded once, retrievable with `tx_id` |
 | `test_step_idempotency_returns_cached_result` | Completed step is retrievable so the runner can skip re-execution |
 | `test_network_timeout_records_unknown_and_reconciles` | Timeout logged as `UNKNOWN` sub-task + audit event |
@@ -189,8 +193,17 @@ One-command containerized startup:
 docker compose up --build
 ```
 
+**Available services:**
+
+| Service | Command | Purpose |
+|---|---|---|
+| `agent` | Normal run | Standard execution, no failure injection |
+| `agent-cache-fail` | `--fail-at cache_update` | Demonstrates HALTED status when cache times out |
+| `agent-complex` | `--fail-at cache_update --partial-write` | Complex recovery with partial DB write + cache timeout |
+| `visualizer` | Flask dashboard | Web UI at port 5000, reads same SQLite DB as agent |
+
 - `Dockerfile` — `python:3.12-slim`, installs deps, runs `main.py`
-- `docker-compose.yml` — mounts `./data` for persistent state, wires `LLM_BASE_URL` to the host's local `llama-server` via `host.docker.internal`
+- `docker-compose.yml` — mounts `./data` for persistent state, wires LLM URL to host's local llama-server via `host.docker.internal`
 
 ## Failure Recovery Demo
 
@@ -320,8 +333,7 @@ resilient-asset-agent/
 │   └── runner.py          # LLM prompt loop & dynamic decision maker
 ├── debug_visualizer/
 │   ├── server.py          # Flask real-time dashboard (reads data/agent_state.db)
-│   ├── requirements.txt   # Flask dependencies
-│   └── README.md          # Visualizer docs
+│   └── requirements.txt   # Flask dependencies
 ├── data/                  # Persistent state volume (agent_state.db, gitignored)
 ├── tests/
 │   ├── test_resilience.py # Automated pytest suite (idempotency, recovery, health)
@@ -335,8 +347,11 @@ resilient-asset-agent/
 ├── Dockerfile             # python:3.12-slim container image
 ├── docker-compose.yml     # One-command startup (mounts ./data, wires LLM URL)
 ├── main.py                # Main CLI runner (with failure injection flags)
+├── ARCHITECTURE.md        # Detailed codebase interconnection docs (classes, functions, data flow)
 └── README.md              # This file
 ```
+
+> **ARCHITECTURE.md** — A living reference documenting every class, method, and function across the codebase, including how they interconnect, call each other, and share state. Useful for onboarding or understanding the full system before diving into changes.
 
 ## License
 
