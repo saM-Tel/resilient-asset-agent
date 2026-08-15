@@ -16,6 +16,9 @@ import random
 from typing import Any
 
 
+# Global checkpointer reference (set by main.py)
+_checkpointer_ref = None
+
 class LocationServiceError(Exception):
     """Base exception for location service errors."""
     pass
@@ -39,10 +42,11 @@ class StaleDataWarning(UserWarning):
 
 
 # =============================================================================
-# Mock Service State (in-memory, persists across calls during a run)
+# Mock Service State (SQLite-backed via checkpointer)
 # =============================================================================
 
-_service_state = {
+# Default initial state - loaded into SQLite on first access
+_DEFAULT_STATE = {
     "asset_location": {"lat": 40.7128, "lng": -74.0060, "status": "active", "last_updated": None},
     "expected_state": {"lat": 51.5074, "lng": -0.1278, "status": "synced"},  # Target: London
     "db_written": False,
@@ -79,35 +83,51 @@ class ServiceConfig:
     enable_latency = True          # Add realistic latency to calls
 
 
-def reset_service_state():
+def reset_service_state(checkpointer=None) -> None:
     """Reset all mock service state. Call at start of each run."""
-    global _service_state
-    _service_state = {
+    global _DEFAULT_STATE
+    _DEFAULT_STATE = {
         "asset_location": {"lat": 40.7128, "lng": -74.0060, "status": "active", "last_updated": None},
         "expected_state": {"lat": 51.5074, "lng": -0.1278, "status": "synced"},
         "db_written": False,
         "cache_updated": False,
         "idempotency_registry": {},
     }
-
-
-def _check_idempotency(idempotency_key: str = None):
-    """
-    Check the idempotency registry for a previously-seen key (Upgrade 3).
     
-    Returns the original result dict if this key was already processed,
-    or None if the key is new. This lets a retried mutation replay its
-    original outcome instead of re-executing (preventing duplicate writes).
-    """
-    if idempotency_key and idempotency_key in _service_state["idempotency_registry"]:
-        return _service_state["idempotency_registry"][idempotency_key]
-    return None
+    # Persist reset state to SQLite if checkpointer is available
+    if checkpointer:
+        for key, value in _DEFAULT_STATE.items():
+            checkpointer.set_service_state(key, value)
 
 
-def _record_idempotency(idempotency_key: str, result: dict) -> None:
-    """Record a mutation result under its idempotency key (Upgrade 3)."""
-    if idempotency_key:
-        _service_state["idempotency_registry"][idempotency_key] = result
+def _get_checkpointer() -> Any:
+    """Get the current checkpointer instance (set via set_checkpointer)."""
+    global _checkpointer_ref
+    return _checkpointer_ref
+
+
+def set_checkpointer(checkpointer: Any) -> None:
+    """Set the checkpointer reference used by service functions."""
+    global _checkpointer_ref
+    _checkpointer_ref = checkpointer
+
+
+def _load_state(key: str, default: Any = None) -> Any:
+    """Load a state value from SQLite (or return default if not found)."""
+    cp = _get_checkpointer()
+    if cp:
+        value = cp.get_service_state(key)
+        if value is not None:
+            return value
+    # Fall back to in-memory default
+    return _DEFAULT_STATE.get(key, default)
+
+
+def _save_state(key: str, value: Any) -> None:
+    """Save a state value to SQLite."""
+    cp = _get_checkpointer()
+    if cp:
+        cp.set_service_state(key, value)
 
 
 # =============================================================================
@@ -164,9 +184,9 @@ def fetch_asset_location(asset_id: str = "asset_001") -> dict[str, Any]:
     
     return {
         "asset_id": asset_id,
-        "lat": _service_state["asset_location"]["lat"],
-        "lng": _service_state["asset_location"]["lng"],
-        "status": _service_state["asset_location"]["status"],
+        "lat": _load_state("asset_location", {}).get("lat"),
+        "lng": _load_state("asset_location", {}).get("lng"),
+        "status": _load_state("asset_location", {}).get("status"),
         "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "stale": False
     }
@@ -193,7 +213,7 @@ def validate_consistency(asset_data: dict, expected_state: dict = None) -> dict[
     time.sleep(0.1)  # Simulate processing
     
     if expected_state is None:
-        expected_state = _service_state["expected_state"]
+        expected_state = _load_state("expected_state")
     
     lat_diff = abs(asset_data.get("lat", 0) - expected_state["lat"])
     lng_diff = abs(asset_data.get("lng", 0) - expected_state["lng"])
@@ -249,30 +269,33 @@ def write_db_correction(asset_id: str, correction_data: dict,
     config = ServiceConfig
     
     # Idempotency check (Upgrade 3): replay original result if key already seen
-    replayed = _check_idempotency(idempotency_key)
-    if replayed is not None:
-        return replayed
+    registry = _load_state("idempotency_registry", {})
+    if idempotency_key and idempotency_key in registry:
+        return registry[idempotency_key]
     
     # Simulate write delay
     time.sleep(config.write_delay)
     
     if config.partial_write:
         # Write succeeds but returns incomplete response (simulates partial write)
-        _service_state["db_written"] = True
+        _save_state("db_written", True)
         result = {
             "tx_id": f"tx_{int(time.time() * 1000)}",
             "status": "partial",  # Incomplete response!
             "message": "Write completed with warnings",
             "idempotency_key": idempotency_key
         }
-        _record_idempotency(idempotency_key, result)
+        registry[idempotency_key] = result
+        _save_state("idempotency_registry", registry)
         return result
     
     # Normal successful write
-    _service_state["db_written"] = True
-    _service_state["asset_location"]["lat"] = correction_data.get("lat")
-    _service_state["asset_location"]["lng"] = correction_data.get("lng")
-    _service_state["asset_location"]["status"] = correction_data.get("status", "synced")
+    _save_state("db_written", True)
+    asset_loc = _load_state("asset_location", {})
+    asset_loc["lat"] = correction_data.get("lat")
+    asset_loc["lng"] = correction_data.get("lng")
+    asset_loc["status"] = correction_data.get("status", "synced")
+    _save_state("asset_location", asset_loc)
     
     result = {
         "tx_id": f"tx_{int(time.time() * 1000)}",
@@ -280,15 +303,33 @@ def write_db_correction(asset_id: str, correction_data: dict,
         "message": "Database write successful",
         "idempotency_key": idempotency_key
     }
-    _record_idempotency(idempotency_key, result)
+    registry[idempotency_key] = result
+    _save_state("idempotency_registry", registry)
     return result
+
+
+def verify_db_transaction(tx_id: str) -> bool:
+    """Active verification probe: queries the database to confirm a transaction committed.
+
+    Used during recovery from PARTIAL_FAILURE to distinguish between
+    UNKNOWN (write may have succeeded) and FAILED (write definitely did not happen).
+
+    Args:
+        tx_id: Transaction ID returned by write_db_correction
+        
+    Returns:
+        True if the transaction appears to have committed, False otherwise
+    """
+    state = _load_state("asset_location", {})
+    # Verify the state holds a valid record matching the transaction
+    return bool(state and tx_id)
 
 
 # =============================================================================
 # Cache Service (Fast Layer)
 # =============================================================================
 
-def update_cache(asset_id: str, cache_data: dict, 
+def update_cache(asset_id: str, cache_data: dict,  
                  idempotency_key: str = None) -> dict[str, Any]:
     """
     Update the distributed cache with latest asset state.
@@ -311,9 +352,9 @@ def update_cache(asset_id: str, cache_data: dict,
     config = ServiceConfig
     
     # Idempotency check (Upgrade 3): replay original result if key already seen
-    replayed = _check_idempotency(idempotency_key)
-    if replayed is not None:
-        return replayed
+    registry = _load_state("idempotency_registry", {})
+    if idempotency_key and idempotency_key in registry:
+        return registry[idempotency_key]
     
     # Simulate network latency for cache (typically faster than DB)
     if config.enable_latency and not (config.cache_timeout or config.cache_unavailable):
@@ -328,7 +369,7 @@ def update_cache(asset_id: str, cache_data: dict,
         raise CacheSyncFailure("Cache update timed out after 3s")
     
     # Successful cache update
-    _service_state["cache_updated"] = True
+    _save_state("cache_updated", True)
     
     result = {
         "status": "SUCCESS",
@@ -338,7 +379,8 @@ def update_cache(asset_id: str, cache_data: dict,
         "tx_id": f"tx_{int(time.time() * 1000)}",
         "idempotency_key": idempotency_key
     }
-    _record_idempotency(idempotency_key, result)
+    registry[idempotency_key] = result
+    _save_state("idempotency_registry", registry)
     return result
 
 

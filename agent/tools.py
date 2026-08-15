@@ -171,6 +171,28 @@ def execute_write_db(checkpointer: Checkpointer, run_id: str,
     existing = checkpointer.get_step_result(run_id, "write_db_correction")
     if existing and existing["status"] in ("COMPLETED", "PARTIAL_FAILURE"):
         status_label = existing["status"]
+        
+        # Active Read-Verification Probe (Refinement 2): when recovering from a
+        # PARTIAL_FAILURE, verify the transaction actually committed before
+        # skipping. This distinguishes UNKNOWN (write may have succeeded) from
+        # FAILED (write definitely did not happen).
+        if status_label == "PARTIAL_FAILURE":
+            tx_id = existing.get("output_data", {}).get("tx_id")
+            try:
+                from stubs.services import verify_db_transaction
+                if tx_id and verify_db_transaction(tx_id):
+                    checkpointer.emit_event(
+                        run_id=run_id,
+                        event="VERIFICATION_PROBE_SUCCESS",
+                        sub_task="database_write",
+                        tx_id=tx_id,
+                        details={"message": "Read probe confirmed transaction exists on server"}
+                    )
+                    print(f"  [PROBE] write_db_correction: Verified tx {tx_id} exists on database. Skipping write.")
+                    return ToolResult(success=True, data=existing.get("output_data"))
+            except Exception as e:
+                print(f"  [WARN] Verification probe failed for tx {tx_id}: {e}")
+        
         print(f"  [SKIP] write_db_correction: Already {status_label}, not re-executing (idempotency)")
         return ToolResult(success=True, data=existing.get("output_data"))
     

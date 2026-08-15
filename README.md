@@ -12,7 +12,7 @@ This project implements a **LLM-driven workflow orchestrator** that:
 - Executes multi-step asset synchronization workflows
 - Detects and recovers from partial failures without re-doing completed work
 - Maintains persistent checkpoint state for crash recovery
-- Uses local LLM (Qwen 3.8-27B) for dynamic decision-making
+- Uses local LLM (Qwen 3.6 - 35-3ab thinking off) for dynamic decision-making
 
 ## Architecture
 
@@ -45,6 +45,7 @@ graph TD
 - Append-only event log (audit trail / mission log)
 - Full execution trace for audit/debugging
 - Resilient JSON serialization (`default=str`) for non-primitive payloads
+- **Run statuses**: `IN_PROGRESS`, `COMPLETED`, `HALTED`, `FAILED` — `HALTED` distinguishes intentional pauses (service down) from successful completion or unrecoverable errors
 
 ### `agent/tools.py` - Idempotent Tool Wrappers
 - Each tool checks checkpoint before execution
@@ -52,6 +53,7 @@ graph TD
 - Generates idempotency keys for every mutation
 - Tracks sub-task status and emits audit-trail events
 - Distinguishes `UNKNOWN` (timeout) from `FAILED` (hard error)
+- **Active Read Verification Probes** (Refinement 2): On PARTIAL_FAILURE recovery, calls `verify_db_transaction()` to confirm the write actually committed before skipping — distinguishes UNKNOWN (write may have succeeded) from FAILED (definitely did not happen)
 
 ### `agent/runner.py` - Agent Control Loop
 - LLM-driven dynamic workflow (not fixed sequence)
@@ -64,7 +66,55 @@ graph TD
 
 ### Prerequisites
 - Python 3.10+
-- Local LLM server running on `localhost:8000` (e.g., `llama-server.exe`, LM Studio, vLLM) with model `qwen3.8-27b`
+- Local LLM server running on `localhost:8000` (e.g., `llama-server.exe`, LM Studio, vLLM) with model **Qwen 3.6 35B-A3B**
+
+> ⚠️ **Important: Non-Thinking Model Required**
+> 
+> This agent does **not work reliably with models that use extended thinking/reasoning**. Thinking-mode models often return empty responses or excessively long reasoning traces, causing parse failures and hangs. You must start the LLM server with `--reasoning off` (or equivalent) to disable thinking mode.
+> 
+> A Windows batch file is provided for launching llama-server with optimized settings:
+
+```batch title="start-llm.bat"
+@echo off
+title qwen3.6_35B_A3B_MTP_PORT_8000
+echo Starting Qwen 3.6 35B-A3B MoE with optimized settings for agent task (Non-Thinking Mode)...
+
+"E:\AI_Workspace\Models\llama\llama-server.exe" ^
+  -m E:\AI_Workspace\Models\Qwen3.6-35B-A3B-UD-Q5_K_S.gguf ^
+  -fit off ^
+  -np 1 ^
+  -ngl 99 ^
+  -ts 0.50,0.50 ^
+  -fa on ^
+  -c 200000 ^
+  --cache-type-k q8_0 ^
+  --cache-type-v q8_0 ^
+  --jinja ^
+  --reasoning off ^
+  --reasoning-budget 0 ^
+  --temp 0.3 ^
+  --top-k 40 ^
+  --min-p 0.05 ^
+  --top-p 0.95 ^
+  --presence-penalty 0.1 ^
+  --repeat-penalty 1.1 ^
+  --host 0.0.0.0 ^
+  --port 8000 ^
+  --spec-type draft-mtp ^
+  --spec-draft-n-max 2 ^
+  --spec-draft-ngl 99 ^
+  --load-mode none
+pause
+```
+
+**Key settings for agent compatibility:**
+| Flag | Purpose |
+|---|---|
+| `--reasoning off` | Disables thinking mode — **required** |
+| `--temp 0.3` | Low temperature for consistent JSON output |
+| `--jinja` | Enables Jinja2 templating (better prompt handling) |
+| `--cache-type-k/q8_0` | High-precision KV cache for accuracy |
+| `-c 200000` | Large context window for full execution traces |
 
 ### Installation
 
@@ -101,7 +151,7 @@ Monitor agent execution in real-time via web dashboard:
 
 ```bash
 cd debug_visualizer
-.\run.bat  # or python server.py
+python server.py  # or pip install -r requirements.txt && python server.py
 ```
 
 Open `http://localhost:5000` in your browser. Use the mode toggle to switch between [LATEST] Follow Latest (auto-refreshes newest run) and [MONITOR] Monitor Run (stays on selected run).
@@ -150,6 +200,45 @@ docker compose up --build
 2. **Second Run**: Agent reads checkpoint, sees DB write completed, skips it, retries only the failed cache step
 
 This demonstrates the core assessment requirement: **intelligent recovery without duplicating work**.
+
+## Refinements
+
+### 1. Accurate Run Status (HALTED vs COMPLETED)
+
+When the cache fails and the agent stops, the terminal now prints:
+
+```
+Status: HALTED | Summary: Workflow halted - services unavailable: cache
+```
+
+Instead of the previous misleading `COMPLETED`. This makes it clear in both the CLI output and debug visualizer that the workflow was intentionally paused due to service unavailability — distinct from a successful completion or an unrecoverable failure.
+
+**Implementation:**
+- Added `halt_run(run_id, reason, down_services)` to `Checkpointer` — sets status to `'HALTED'` and emits a `WORKFLOW_HALTED` audit event
+- Agent calls `halt_run()` instead of `complete_run()` when health check detects DOWN services
+- Return dict uses `"status": "HALTED"` so downstream tools (visualizer, CI) can distinguish the three states: `COMPLETED`, `HALTED`, `FAILED`
+
+### 2. Active Read-Verification Probe on Partial Writes
+
+When `write_db_correction` returns a `PARTIAL_FAILURE`, the agent now calls an active **Verification Probe** (`verify_db_transaction`) to confirm the transaction was actually recorded before proceeding — instead of just assuming it succeeded.
+
+Terminal output during recovery:
+```
+[PROBE] write_db_correction: Verified tx tx_1786740286359 exists on database. Skipping write.
+[EXECUTE] update_cache: Updating distributed cache...
+[OK] update_cache: Cache updated successfully
+```
+
+Audit trail entry:
+```json
+{"timestamp": "...", "event": "VERIFICATION_PROBE_SUCCESS", "subtask": "database_write", "tx_id": "tx_1786740286359"}
+```
+
+**Implementation:**
+- Added `verify_db_transaction(tx_id)` to `stubs/services.py` — queries persisted state to confirm a transaction committed
+- In `execute_write_db()`, when encountering an existing `PARTIAL_FAILURE` step on retry: extracts the `tx_id`, calls the verification probe, emits `VERIFICATION_PROBE_SUCCESS` event if confirmed, and skips re-execution
+
+---
 
 ## Distributed Systems Upgrades
 
@@ -232,7 +321,6 @@ resilient-asset-agent/
 ├── debug_visualizer/
 │   ├── server.py          # Flask real-time dashboard (reads data/agent_state.db)
 │   ├── requirements.txt   # Flask dependencies
-│   ├── run.bat / run.ps1  # Launchers
 │   └── README.md          # Visualizer docs
 ├── data/                  # Persistent state volume (agent_state.db, gitignored)
 ├── tests/

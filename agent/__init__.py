@@ -8,6 +8,13 @@ Contains:
 """
 
 from agent.checkpointer import Checkpointer
-from agent.runner import AssetSyncAgent
 
-__all__ = ["Checkpointer", "AssetSyncAgent"]
+__all__ = ["Checkpointer"]
+
+
+def __getattr__(name):
+    """Lazy-load AssetSyncAgent only when actually imported (avoids openai requirement in test env)."""
+    if name == "AssetSyncAgent":
+        from agent.runner import AssetSyncAgent
+        return AssetSyncAgent
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -157,7 +157,12 @@ def main():
     
     # Persist state under ./data so it survives container restarts
     # (docker-compose mounts ./data:/app/data).
-    checkpointer = Checkpointer(db_path="data/agent_state.db")
+    checkpointer = Checkpointer()
+    
+    # Wire up the checkpointer reference so services can persist state to SQLite
+    from stubs.services import set_checkpointer, reset_service_state
+    set_checkpointer(checkpointer)
+    reset_service_state(checkpointer)  # Initialize service state in DB
     
     try:
         # Create and run the agent
