@@ -4,7 +4,7 @@
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path("agent_state.db")
+DB_PATH = Path("data/agent_state.db")
 
 print("\n" + "="*70)
 print("TESTING VISUALIZER DATABASE ACCESS")

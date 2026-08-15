@@ -15,13 +15,14 @@ Then open http://localhost:5000 in your browser
 """
 
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
-DB_PATH = Path(__file__).parent.parent / "agent_state.db"
+DB_PATH = Path(__file__).parent.parent / "data" / "agent_state.db"
 
 
 def get_db_connection():
@@ -1078,7 +1079,11 @@ if __name__ == "__main__":
     print("✓ Open this URL in your browser to view the dashboard")
     print("✓ Auto-refreshes every 1 second\n")
     print("  Database path:", DB_PATH)
-    print("  (Make sure agent_state.db exists in the project root)\n")
+    print("  (Make sure data/agent_state.db exists)\n")
     print("="*60 + "\n")
-    
-    app.run(debug=False, host="localhost", port=5000)
+
+    # Bind to all interfaces by default so the visualizer is reachable when
+    # containerized or accessed over the network. Override with VISUALIZER_HOST
+    # (e.g. "localhost") to restrict to a single interface.
+    host = os.environ.get("VISUALIZER_HOST", "0.0.0.0")
+    app.run(debug=False, host=host, port=5000)

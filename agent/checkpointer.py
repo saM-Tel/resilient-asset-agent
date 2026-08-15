@@ -28,8 +28,11 @@ class Checkpointer:
     3. Full audit trail of all decisions and outcomes
     """
     
-    def __init__(self, db_path: str = "agent_state.db"):
+    def __init__(self, db_path: str = "data/agent_state.db"):
         self.db_path = Path(db_path)
+        # Ensure the parent directory exists so the DB can be created.
+        # This keeps state on a persistent volume (e.g. Docker ./data mount).
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), timeout=10.0)
         self._create_tables()
     
@@ -128,7 +131,17 @@ class Checkpointer:
         columns = [row[1] for row in cursor.fetchall()]
         if "idempotency_key" not in columns:
             cursor.execute("ALTER TABLE steps ADD COLUMN idempotency_key TEXT")
-        
+
+        # Service state table (Upgrade 4): replaces in-memory _service_state dict.
+        # Stores mock service data and the idempotency registry so they survive
+        # process crashes — making idempotency keys durable across restarts.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS service_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
         self.conn.commit()
     
     def clear_run(self, run_id: str) -> None:
@@ -192,7 +205,31 @@ class Checkpointer:
             WHERE run_id = ? AND id = (SELECT MAX(id) FROM steps WHERE run_id = ?)
         """, (error, time.time(), run_id, run_id))
         self.conn.commit()
-    
+
+    def halt_run(self, run_id: str, reason: str, down_services: list = None) -> None:
+        """Sets run status to HALTED when waiting on downstream dependencies.
+
+        Used when the agent detects a service is DOWN and cannot proceed until
+        it recovers — distinct from COMPLETED (all steps done) or FAILED
+        (unrecoverable error).
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE runs SET status = 'HALTED', completed_at = ? WHERE run_id = ?",
+            (time.time(), run_id)
+        )
+        self.conn.commit()
+
+        self.emit_event(
+            run_id=run_id,
+            event="WORKFLOW_HALTED",
+            sub_task="reconciliation",
+            details={
+                "reason": reason,
+                "down_services": down_services or [],
+            }
+        )
+
     def get_run_status(self, run_id: str) -> Optional[dict]:
         """Get the status of a specific run."""
         cursor = self.conn.cursor()
@@ -558,6 +595,46 @@ class Checkpointer:
                 'timestamp': row[3]
             })
         return results
+    
+    # =========================================================================
+    # Upgrade 4: Service State Persistence (replaces in-memory dict)
+    # =========================================================================
+    
+    def set_service_state(self, key: str, value: Any) -> None:
+        """
+        Store a service state value in the database.
+        
+        Replaces the in-memory _service_state dict so that mock service data
+        and the idempotency registry survive process crashes.
+        
+        Args:
+            key: State key (e.g., 'asset_location', 'expected_state', 
+                 'idempotency_registry')
+            value: Value to store (will be JSON-serialized)
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO service_state (key, value)
+            VALUES (?, ?)
+        """, (key, json.dumps(value, default=str)))
+        self.conn.commit()
+    
+    def get_service_state(self, key: str) -> Optional[Any]:
+        """
+        Retrieve a service state value from the database.
+        
+        Args:
+            key: State key to retrieve
+            
+        Returns:
+            Deserialized value, or None if not found
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT value FROM service_state WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        if row:
+            return json.loads(row[0])
+        return None
     
     def close(self):
         """Close the database connection."""

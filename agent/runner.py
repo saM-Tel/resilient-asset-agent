@@ -55,7 +55,23 @@ class AssetSyncAgent:
             if step.get("step_name") == step_name and step.get("output_data"):
                 return step["output_data"]
         return None
-    
+
+    def _get_correction_data(self, completed_steps: list[dict]) -> Optional[dict]:
+        """Get corrected coordinates written by write_db_correction, if any.
+
+        The correction is stored in the step's input_data under
+        'correction_data'. Returns None when no correction was applied so
+        callers can fall back to the original fetch_location values.
+        """
+        for step in reversed(completed_steps):
+            if step.get("step_name") != "write_db_correction":
+                continue
+            input_data = step.get("input_data") or {}
+            correction = input_data.get("correction_data")
+            if correction:
+                return correction
+        return None
+
     def get_execution_context(self) -> dict:
         """
         Build the current execution context from checkpoint store.
@@ -304,7 +320,17 @@ Decide next action. Return JSON only."""
             if not location_data:
                 return False, {"error": "No location data available - must fetch first"}
             
-            cache_data = parameters.get("cache_data") or location_data
+            # Prefer corrected coordinates from write_db_correction over the
+            # original fetch_location output, so the cache never holds stale
+            # values when a correction was applied in step 3.
+            cache_data = dict(location_data)
+            correction = self._get_correction_data(completed)
+            if correction:
+                for field in ("lat", "lng"):
+                    if correction.get(field) is not None:
+                        cache_data[field] = correction[field]
+            
+            cache_data = parameters.get("cache_data") or cache_data
             
             result = execute_update_cache(self.checkpointer, self.run_id, cache_data)
             return result.success, result.to_dict()
@@ -374,6 +400,16 @@ Decide next action. Return JSON only."""
             # reconciliation. If a step just failed (e.g. cache timeout ->
             # UNKNOWN), we must run the health check / halt logic first rather
             # than declaring success over an indeterminate state.
+            #
+            # NOTE ON WHEN THIS FIRES: In this example project, clear_run() wipes
+            # all steps at the start of a re-run (main.py line ~170), so
+            # auto-complete never actually triggers - there's nothing to complete
+            # against on restart. It IS useful in real-world scenarios where state
+            # persists across process crashes or long-running agents: if all 4
+            # steps finish naturally within a single run, the loop would otherwise
+            # still ask the LLM one more time (iteration N+1) before exiting when
+            # the LLM returns "DONE". Auto-complete avoids that extra LLM call by
+            # detecting completion at the top of the next iteration instead.
             if not self._force_health_check:
                 completed_step_names = set(s["step_name"] for s in context["completed_steps"])
                 partial_step_names = set(s["step_name"] for s in context["partial_steps"])
@@ -432,9 +468,13 @@ Decide next action. Return JSON only."""
                         details={"down_services": down_services,
                                  "reason": "service_unavailable"}
                     )
-                    self.checkpointer.complete_run(self.run_id)
+                    self.checkpointer.halt_run(
+                        run_id=self.run_id,
+                        reason="service_unavailable",
+                        down_services=down_services
+                    )
                     return {
-                        "status": "COMPLETED",  # Intelligently halted, not failed
+                        "status": "HALTED",  # Distinct from COMPLETED — services unavailable
                         "iterations": iteration,
                         "summary": f"Workflow halted - services unavailable: {', '.join(down_services)}"
                     }
@@ -449,7 +489,7 @@ Decide next action. Return JSON only."""
             
             try:
                 response = self.client.chat.completions.create(
-                    model="qwen3.8-27b",
+                    model="qwen3.5-35b-thinking-off",
                     messages=messages,
                     temperature=0.1,
                     max_tokens=200,  # Shorter responses minimize thinking mode
