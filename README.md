@@ -402,6 +402,12 @@ This is visible in the event log, the sub-task records, and the step output.
 
 4. **Adaptive Retry with Exponential Backoff**: Replace fixed retry limits with intelligent backoff strategies that increase wait times between retries based on service health trends and historical recovery patterns.
 
+5. **Robust Thinking-Mode Compatibility**: The agent currently requires a non-thinking model (`--reasoning off`) because thinking-mode models return long reasoning traces or empty content that break JSON parsing. With more time, I would make the agent work reliably with thinking-mode models too:
+   - **Reasoning-aware response parsing**: Detect and strip `reasoning_content` / thinking blocks (e.g., `think` tags) before extracting the JSON action, instead of relying on the server to suppress them
+   - **Structured output enforcement**: Use JSON-schema-constrained decoding (where the server supports it) or a two-phase prompt (reason freely, then emit a final `FINAL_ANSWER:` JSON block) so the decision is always machine-parseable regardless of reasoning length
+   - **Adaptive token/timeout budgeting**: Dynamically raise `max_tokens` and request timeouts when a thinking model is detected, and fall back to the force-progress path only after reasoning-aware parsing has genuinely failed
+   - **Model capability probing**: Auto-detect at startup whether the connected model supports thinking mode and adjust the prompt, parsing strategy, and budgets accordingly — removing the hard requirement on `--reasoning off`
+
 ## Project Structure
 
 ```
