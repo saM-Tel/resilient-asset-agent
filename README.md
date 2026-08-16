@@ -92,7 +92,7 @@ echo Starting Qwen 3.6 35B-A3B MoE with optimized settings for agent task (Non-T
   --jinja ^
   --reasoning off ^
   --reasoning-budget 0 ^
-  --temp 0.3 ^
+  --temp 0.1 ^
   --top-k 40 ^
   --min-p 0.05 ^
   --top-p 0.95 ^
@@ -111,7 +111,7 @@ pause
 | Flag | Purpose |
 |---|---|
 | `--reasoning off` | Disables thinking mode — **required** |
-| `--temp 0.3` | Low temperature for consistent JSON output |
+| `--temp 0.1` | Low temperature for consistent JSON output |
 | `--jinja` | Enables Jinja2 templating (better prompt handling) |
 | `--cache-type-k/q8_0` | High-precision KV cache for accuracy |
 | `-c 200000` | Large context window for full execution traces |
