@@ -146,14 +146,20 @@ python main.py --run-id complex-scenario --fail-at cache_update --partial-write
 ```
 
 **All supported scenario switches:**
-- `--fail-at cache_update|location_service|location_unavailable|cache_unavailable`
+- `--fail-at cache_update|location_service|location_unavailable|cache_unavailable|llm_connection`
 - `--inject-stale`
 - `--partial-write`
 
+**Simulate an LLM connection drop / server outage:**
+```bash
+python main.py --run-id llm-test --clear --fail-at llm_connection
+```
+The agent fails at iteration 1 with `Status: FAILED` and an `LLM_SERVER_UNREACHABLE` audit event (subtask `reasoning_engine`). Re-running without the flag resumes from the checkpoint and completes normally — no steps were executed, so nothing is duplicated.
+
 ### Scenario Matrix (Validated)
 
-The agent supports 20 initial-run combinations:
-- `fail_at`: `none`, `cache_update`, `location_service`, `location_unavailable`, `cache_unavailable`
+The agent supports 24 initial-run combinations:
+- `fail_at`: `none`, `cache_update`, `location_service`, `location_unavailable`, `cache_unavailable`, `llm_connection`
 - `inject_stale`: `0|1`
 - `partial_write`: `0|1`
 
@@ -181,12 +187,42 @@ Validated outcomes (initial run with `--clear`):
 | cache_unavailable | 0 | 1 | HALTED (cache down) | HALTED |
 | cache_unavailable | 1 | 0 | HALTED (cache down) | HALTED |
 | cache_unavailable | 1 | 1 | HALTED (cache down) | HALTED |
+| llm_connection | 0 | 0 | FAILED (LLM server unreachable) | FAILED |
+| llm_connection | 0 | 1 | FAILED (LLM server unreachable) | FAILED |
+| llm_connection | 1 | 0 | FAILED (LLM server unreachable) | FAILED |
+| llm_connection | 1 | 1 | FAILED (LLM server unreachable) | FAILED |
+
+> `llm_connection` fails before any workflow step executes (the LLM call itself is refused), so the outcome is `FAILED` regardless of the other injection flags. The audit trail records an `LLM_SERVER_UNREACHABLE` event with subtask `reasoning_engine`.
 
 Validated recovery behavior (resume without failure flags):
 - `cache_update` scenarios resume and complete by retrying `update_cache`.
 - `cache_unavailable` scenarios resume and complete once cache unavailability injection is removed.
 - `location_service` scenarios resume and complete once location service timeout injection is removed.
 - `location_unavailable` scenarios resume and complete once location service unavailability injection is removed.
+- `llm_connection` scenarios resume and complete from the checkpoint once the LLM server is reachable again (no steps were executed, so the full workflow runs fresh).
+
+### Full Demo Sequence (Non-Matrix)
+
+A single PowerShell command that exercises every failure mode and recovery path end-to-end — downstream failures, ingestion failures, LLM outage, and a chained multi-failure run — followed by the automated test suite:
+
+```powershell
+python main.py --run-id demo-downstream --clear --inject-stale --partial-write --fail-at cache_update; Start-Sleep 2; python main.py --run-id demo-downstream; Start-Sleep 2; python main.py --run-id demo-ingestion --clear --fail-at location_service; Start-Sleep 2; python main.py --run-id demo-ingestion; Start-Sleep 2; python main.py --run-id demo-llm --clear --fail-at llm_connection; Start-Sleep 2; python main.py --run-id demo-llm; Start-Sleep 2; python main.py --run-id chain-demo --clear --fail-at location_service; Start-Sleep 2; python main.py --run-id chain-demo --inject-stale --partial-write --fail-at cache_update; Start-Sleep 2; python main.py --run-id chain-demo; Start-Sleep 2; pytest tests/ -v
+```
+
+What each phase demonstrates:
+
+| Phase | Run ID | Flags | Demonstrates |
+|---|---|---|---|
+| 1 | `demo-downstream` | `--clear --inject-stale --partial-write --fail-at cache_update` | Downstream failure: stale data + partial DB write + cache timeout → `HALTED` (cache down) |
+| 2 | `demo-downstream` | *(resume)* | Recovery: skips completed steps, retries `update_cache` → `COMPLETED` |
+| 3 | `demo-ingestion` | `--clear --fail-at location_service` | Ingestion failure: location service timeout → `HALTED` (location service down) |
+| 4 | `demo-ingestion` | *(resume)* | Recovery: retries `fetch_location` and completes the workflow → `COMPLETED` |
+| 5 | `demo-llm` | `--clear --fail-at llm_connection` | LLM outage: connection refused at `localhost:8000` → `FAILED` with `LLM_SERVER_UNREACHABLE` audit event |
+| 6 | `demo-llm` | *(resume)* | Recovery: LLM back online, full workflow runs from checkpoint → `COMPLETED` |
+| 7 | `chain-demo` | `--clear --fail-at location_service` | Chained failures, stage 1: location timeout → `HALTED` |
+| 8 | `chain-demo` | `--inject-stale --partial-write --fail-at cache_update` | Chained failures, stage 2: location recovered but cache now down → `HALTED` (cache down) |
+| 9 | `chain-demo` | *(resume)* | Full recovery: all services healthy, workflow completes → `COMPLETED` |
+| 10 | — | `pytest tests/ -v` | Automated suite: 11 tests covering idempotency, recovery, and health checks |
 
 ### Debug Visualizer
 
@@ -424,6 +460,7 @@ MIT
 | Duplicate `tx_id` | Second-precision timestamps collided on rapid writes | Millisecond-precision `tx_id` generation |
 | DB Locks (Visualizer + Agent) | Concurrent SQLite reads/writes without WAL | WAL mode, `busy_timeout=5000`, `timeout=10.0` connections |
 | N+1 Visualizer Queries | Per-run queries in a loop for the run list | Batched single-query fetches in `api_runs`/`get_run_data` |
+| LLM-Driven Halt Recorded as FAILED | `execute_action("halt")` called `complete_run()` and the loop fell through to the max-iterations `FAILED` path | `halt` action now calls `halt_run()` and the loop returns `HALTED` directly |
 
 ### Implementation Phases
 

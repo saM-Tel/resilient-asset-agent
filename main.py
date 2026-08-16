@@ -61,6 +61,9 @@ def configure_failure_injection(args: argparse.Namespace) -> None:
     elif args.fail_at == "cache_unavailable":
         ServiceConfig.cache_unavailable = True
         print("[WARN] FAILURE INJECTION: Cache service will be unavailable")
+
+    elif args.fail_at == "llm_connection":
+        print("[WARN] FAILURE INJECTION: LLM server connection will be refused")
     
     if args.inject_stale:
         ServiceConfig.inject_stale_data = True
@@ -121,7 +124,7 @@ def main():
     parser.add_argument(
         "--fail-at",
         type=str,
-        choices=["cache_update", "location_service", "location_unavailable", "cache_unavailable"],
+        choices=["cache_update", "location_service", "location_unavailable", "cache_unavailable", "llm_connection"],
         default=None,
         help="Inject failure at specific step (simulates real-world failures)"
     )
@@ -198,7 +201,7 @@ def main():
     
     try:
         # Create and run the agent
-        agent = AssetSyncAgent(client, checkpointer, args.run_id)
+        agent = AssetSyncAgent(client, checkpointer, args.run_id, fail_at=args.fail_at)
         result = agent.run()
         
         # Print summary

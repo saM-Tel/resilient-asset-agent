@@ -40,10 +40,12 @@ class AssetSyncAgent:
     - Full audit trail of all decisions
     """
     
-    def __init__(self, client: OpenAI, checkpointer: Checkpointer, run_id: str):
+    def __init__(self, client: OpenAI, checkpointer: Checkpointer, run_id: str,
+                 fail_at: Optional[str] = None):
         self.client = client
         self.checkpointer = checkpointer
         self.run_id = run_id
+        self.fail_at = fail_at
         
         # Recovery state tracking (persists across iterations)
         self._force_health_check = False
@@ -400,7 +402,14 @@ Decide next action. Return JSON only."""
         elif action in ["halt", "stop"]:
             # Agent has decided to halt due to service unavailability
             print(f"[INFO] Workflow halted by agent: {reasoning}")
-            self.checkpointer.complete_run(self.run_id)  # Mark as completed (intelligently halted)
+            # Mark as HALTED (not COMPLETED) so the run status reflects an
+            # intentional pause pending service recovery.
+            down_services = [svc for svc, healthy in (self._last_health_results or {}).items() if not healthy]
+            self.checkpointer.halt_run(
+                run_id=self.run_id,
+                reason="service_unavailable",
+                down_services=down_services
+            )
             return True, {"message": f"Workflow halted - {reasoning}"}
         
         else:
@@ -534,6 +543,18 @@ Decide next action. Return JSON only."""
             # Build and send prompt to LLM
             messages = self.build_llm_prompt(context)
             
+            # Check for simulated LLM connection drop
+            if self.fail_at == "llm_connection":
+                print("  [FAIL] LLM Client: Connection refused at http://localhost:8000/v1 (ConnectionError)")
+                self.checkpointer.emit_event(
+                    run_id=self.run_id,
+                    event="LLM_SERVER_UNREACHABLE",
+                    sub_task="reasoning_engine",
+                    details={"error": "ConnectionRefusedError: Local LLM server offline"}
+                )
+                self.checkpointer.fail_run(self.run_id, error="LLM server unreachable")
+                return {"status": "FAILED", "iterations": iteration, "summary": "LLM server connection failed"}
+
             try:
                 response = self.client.chat.completions.create(
                     model="qwen3.6-35b-thinking-off",
@@ -612,7 +633,14 @@ Decide next action. Return JSON only."""
                         }
                 
                 success, result = self.execute_action(action, parameters, reasoning)
-                
+                if decision.get("action") in ["halt", "stop"]:
+                    # Agent chose to halt (services down) - exit the loop and
+                    # report HALTED so the run status is not overwritten.
+                    return {
+                        "status": "HALTED",
+                        "iterations": iteration,
+                        "summary": f"Workflow halted - {reasoning}"
+                    }
                 if not success:
                     print(f"[FAIL] {action}: {result.get('error', 'Unknown error')}")
                     

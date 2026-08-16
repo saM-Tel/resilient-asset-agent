@@ -38,7 +38,7 @@ main.py ──creates──▶ OpenAI client (local LLM)
 | Function / Class | Purpose | Calls / Depends On |
 |---|---|---|
 | `create_client(base_url)` | Creates an `OpenAI` client pointing at a local llama-server (port 8000). | `openai.OpenAI` |
-| `configure_failure_injection(args)` | Sets global knobs on `ServiceConfig` based on CLI flags (`--fail-at`, `--inject-stale`, `--partial-write`). | `stubs.services.ServiceConfig` |
+| `configure_failure_injection(args)` | Sets global knobs on `ServiceConfig` based on CLI flags (`--fail-at`, `--inject-stale`, `--partial-write`). `--fail-at llm_connection` is special: it does not touch `ServiceConfig` — the LLM outage is injected directly in the agent's LLM call (see `runner.py`). | `stubs.services.ServiceConfig` |
 | `print_audit_trail(checkpointer, run_id)` | Renders the append-only event log as JSON lines. | `checkpointer.get_events(run_id)` |
 | `main()` | Orchestrates everything: parses args → creates client → configures failures → instantiates Checkpointer & Agent → runs agent → prints summary + audit trail. | All modules |
 
@@ -96,14 +96,14 @@ main.py ──creates──▶ OpenAI client (local LLM)
 
 | Class / Method | Purpose | Calls / Depends On |
 |---|---|---|
-| `AssetSyncAgent.__init__(client, checkpointer, run_id)` | Initializes agent with LLM client, checkpoint store, and run ID. Sets `_force_health_check = False`, `_last_health_results = None`. | — |
+| `AssetSyncAgent.__init__(client, checkpointer, run_id, fail_at=None)` | Initializes agent with LLM client, checkpoint store, run ID, and optional failure-injection knob. Sets `_force_health_check = False`, `_last_health_results = None`. `fail_at="llm_connection"` triggers a simulated LLM server outage on the first LLM call. | — |
 | `_get_latest_step_output(completed_steps, step_name)` | Finds the most recent completed step by name and returns its `output_data`. | Used internally by `execute_action()` |
 | `_get_correction_data(completed_steps)` | Extracts corrected coordinates from a `write_db_correction` step's `input_data.correction_data`. | Used by `execute_action("update_cache")` |
 | `get_execution_context()` | Builds the full execution state: run status, completed/failed/partial steps, execution trace. | Called at top of every `run()` iteration |
 | `build_llm_prompt(context)` | Constructs a system + user message pair for the LLM. Encodes failure-handling rules (health check on failure, halt on DOWN services, skip partial steps). Injects `_force_health_check` flag and previous health results when relevant. | Agent's `run()` loop → calls LLM API |
 | `parse_llm_response(response_content, context)` | Extracts JSON from the LLM response. Handles markdown code blocks, embedded JSON objects, and multiple fallback strategies (context-aware defaults → absolute default of `fetch_location`). | Called after every LLM call in `run()` |
 | `execute_action(action, parameters, reasoning)` | Dispatches to the correct tool wrapper based on the LLM's chosen action. Handles special actions (`DONE`, `halt`/`stop`) and data dependencies between steps. | Tool wrappers + `stubs.services.check_service_health` |
-| `run()` | **The main control loop.** Iterates up to `max_iterations` (default 15): get context → build prompt → call LLM → parse response → execute action → save decision → check completion. Sets `_force_health_check = True` after any failure, forcing a health check on the next iteration. Returns final result dict. | Everything — orchestrates one full agent execution |
+| `run()` | **The main control loop.** Iterates up to `max_iterations` (default 15): get context → build prompt → call LLM → parse response → execute action → save decision → check completion. Sets `_force_health_check = True` after any failure, forcing a health check on the next iteration. Returns final result dict. **LLM outage injection:** immediately before `client.chat.completions.create(...)`, if `self.fail_at == "llm_connection"` the agent prints a `[FAIL]` marker, emits an `LLM_SERVER_UNREACHABLE` audit event (subtask `reasoning_engine`), calls `fail_run()`, and returns `"status": "FAILED"` — simulating a connection refusal to the local LLM server without touching any workflow step. | Everything — orchestrates one full agent execution |
 
 **The `run()` loop logic:**
 ```
@@ -132,7 +132,7 @@ for each iteration:
 | `check_system_health` | Calls `stubs.services.check_service_health()` → stores results in `_last_health_results` for next iteration. | None |
 | `halt` / `stop` | Marks run as completed (intelligent halt), prints reasoning. | — |
 
-**Halt path in `run()` loop:** When health check detects DOWN services, the agent calls `self.checkpointer.halt_run(run_id=self.run_id, reason="service_unavailable", down_services=down_services)` and returns `"status": "HALTED"` instead of `"COMPLETED"`.
+**Halt path in `run()` loop:** When health check detects DOWN services, the agent calls `self.checkpointer.halt_run(run_id=self.run_id, reason="service_unavailable", down_services=down_services)` and returns `"status": "HALTED"` instead of `"COMPLETED"`. The same applies when the LLM itself chooses the `halt` action: `execute_action("halt")` calls `halt_run()` (deriving `down_services` from `_last_health_results`) and the loop returns `"status": "HALTED"` — so LLM-driven halts are recorded as `HALTED`, never overwritten by the max-iterations `FAILED` path.
 
 ---
 
@@ -421,6 +421,9 @@ python main.py --run-id test-004 --fail-at location_service
 # Location service unavailable
 python main.py --run-id test-005 --fail-at location_unavailable
 
+# LLM connection drop / server outage (fails before any step executes)
+python main.py --run-id test-009 --clear --fail-at llm_connection
+
 # Stale location data injection
 python main.py --run-id test-006 --inject-stale
 
@@ -434,11 +437,11 @@ python main.py --run-id test-008 --llm-url http://localhost:8080/v1
 ### Validated Scenario Matrix
 
 CLI-exposed matrix dimensions:
-- `--fail-at`: `none`, `cache_update`, `cache_unavailable`, `location_service`, `location_unavailable`
+- `--fail-at`: `none`, `cache_update`, `cache_unavailable`, `location_service`, `location_unavailable`, `llm_connection`
 - `--inject-stale`: `0|1`
 - `--partial-write`: `0|1`
 
-Total initial-run combinations: $5 \times 2 \times 2 = 20$.
+Total initial-run combinations: $6 \times 2 \times 2 = 24$.
 
 Observed initial outcomes:
 - `fail_at=none` combinations: `COMPLETED`
@@ -446,9 +449,11 @@ Observed initial outcomes:
 - `fail_at=cache_unavailable` combinations: `HALTED`
 - `fail_at=location_service` combinations: `HALTED`
 - `fail_at=location_unavailable` combinations: `HALTED`
+- `fail_at=llm_connection` combinations: `FAILED` (LLM server unreachable — fails before any workflow step executes, so the other injection flags have no effect)
 
 Observed resume outcomes (same `run_id`, no failure flags):
 - All halted combinations resumed to `COMPLETED`.
+- `llm_connection` combinations resume to `COMPLETED` once the LLM server is reachable again (no steps were executed, so the full workflow runs fresh from the checkpoint).
 
 ---
 
