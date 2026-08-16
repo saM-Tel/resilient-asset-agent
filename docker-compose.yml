@@ -6,3 +6,26 @@ services:
     command: ["python", "main.py", "--run-id", "docker-demo", "--llm-url", "http://host.docker.internal:8000/v1"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  # Run with cache timeout failure injection (demonstrates HALTED status)
+  agent-cache-fail:
+    extends:
+      service: agent
+    command: ["python", "main.py", "--run-id", "docker-cache-fail", "--fail-at", "cache_update", "--llm-url", "http://host.docker.internal:8000/v1"]
+
+  # Run with partial write + cache timeout (complex recovery scenario)
+  agent-complex:
+    extends:
+      service: agent
+    command: ["python", "main.py", "--run-id", "docker-complex", "--fail-at", "cache_update", "--partial-write", "--llm-url", "http://host.docker.internal:8000/v1"]
+
+  # Debug visualizer — reads the same SQLite DB as the agent
+  visualizer:
+    image: python:3.12-slim
+    working_dir: /app/debug_visualizer
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    ports:
+      - "5000:5000"
+    command: ["sh", "-c", "pip install --no-cache-dir -r requirements.txt && python server.py"]

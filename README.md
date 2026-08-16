@@ -92,7 +92,7 @@ echo Starting Qwen 3.6 35B-A3B MoE with optimized settings for agent task (Non-T
   --jinja ^
   --reasoning off ^
   --reasoning-budget 0 ^
-  --temp 0.3 ^
+  --temp 0.1 ^
   --top-k 40 ^
   --min-p 0.05 ^
   --top-p 0.95 ^
@@ -111,7 +111,7 @@ pause
 | Flag | Purpose |
 |---|---|
 | `--reasoning off` | Disables thinking mode — **required** |
-| `--temp 0.3` | Low temperature for consistent JSON output |
+| `--temp 0.1` | Low temperature for consistent JSON output |
 | `--jinja` | Enables Jinja2 templating (better prompt handling) |
 | `--cache-type-k/q8_0` | High-precision KV cache for accuracy |
 | `-c 200000` | Large context window for full execution traces |
@@ -144,6 +144,49 @@ python main.py --run-id video-demo --fail-at cache_update
 ```bash
 python main.py --run-id complex-scenario --fail-at cache_update --partial-write
 ```
+
+**All supported scenario switches:**
+- `--fail-at cache_update|location_service|location_unavailable|cache_unavailable`
+- `--inject-stale`
+- `--partial-write`
+
+### Scenario Matrix (Validated)
+
+The agent supports 20 initial-run combinations:
+- `fail_at`: `none`, `cache_update`, `location_service`, `location_unavailable`, `cache_unavailable`
+- `inject_stale`: `0|1`
+- `partial_write`: `0|1`
+
+Validated outcomes (initial run with `--clear`):
+
+| fail_at | inject_stale | partial_write | Expected Initial Status | Observed |
+|---|---:|---:|---|---|
+| none | 0 | 0 | COMPLETED | COMPLETED |
+| none | 0 | 1 | COMPLETED | COMPLETED |
+| none | 1 | 0 | COMPLETED | COMPLETED |
+| none | 1 | 1 | COMPLETED | COMPLETED |
+| cache_update | 0 | 0 | HALTED (cache down) | HALTED |
+| cache_update | 0 | 1 | HALTED (cache down) | HALTED |
+| cache_update | 1 | 0 | HALTED (cache down) | HALTED |
+| cache_update | 1 | 1 | HALTED (cache down) | HALTED |
+| location_service | 0 | 0 | HALTED (location service down) | HALTED |
+| location_service | 0 | 1 | HALTED (location service down) | HALTED |
+| location_service | 1 | 0 | HALTED (location service down) | HALTED |
+| location_service | 1 | 1 | HALTED (location service down) | HALTED |
+| location_unavailable | 0 | 0 | HALTED (location service down) | HALTED |
+| location_unavailable | 0 | 1 | HALTED (location service down) | HALTED |
+| location_unavailable | 1 | 0 | HALTED (location service down) | HALTED |
+| location_unavailable | 1 | 1 | HALTED (location service down) | HALTED |
+| cache_unavailable | 0 | 0 | HALTED (cache down) | HALTED |
+| cache_unavailable | 0 | 1 | HALTED (cache down) | HALTED |
+| cache_unavailable | 1 | 0 | HALTED (cache down) | HALTED |
+| cache_unavailable | 1 | 1 | HALTED (cache down) | HALTED |
+
+Validated recovery behavior (resume without failure flags):
+- `cache_update` scenarios resume and complete by retrying `update_cache`.
+- `cache_unavailable` scenarios resume and complete once cache unavailability injection is removed.
+- `location_service` scenarios resume and complete once location service timeout injection is removed.
+- `location_unavailable` scenarios resume and complete once location service unavailability injection is removed.
 
 ### Debug Visualizer
 
@@ -233,7 +276,9 @@ Instead of the previous misleading `COMPLETED`. This makes it clear in both the 
 
 ### 2. Active Read-Verification Probe on Partial Writes
 
-When `write_db_correction` returns a `PARTIAL_FAILURE`, the agent now calls an active **Verification Probe** (`verify_db_transaction`) to confirm the transaction was actually recorded before proceeding — instead of just assuming it succeeded.
+When `write_db_correction` returns a `PARTIAL_FAILURE`, the agent can invoke an active **Verification Probe** (`verify_db_transaction`) to confirm the transaction was actually recorded before proceeding.
+
+When probe verification succeeds, the step is promoted from `PARTIAL_FAILURE` to `COMPLETED` in SQLite so the agent does not loop on repeated probes.
 
 Terminal output during recovery:
 ```
@@ -249,7 +294,9 @@ Audit trail entry:
 
 **Implementation:**
 - Added `verify_db_transaction(tx_id)` to `stubs/services.py` — queries persisted state to confirm a transaction committed
-- In `execute_write_db()`, when encountering an existing `PARTIAL_FAILURE` step on retry: extracts the `tx_id`, calls the verification probe, emits `VERIFICATION_PROBE_SUCCESS` event if confirmed, and skips re-execution
+- In `runner.py` (`execute_action("verify_db_transaction")`): probe success emits `VERIFICATION_PROBE_SUCCESS` and promotes `write_db_correction` from `PARTIAL_FAILURE` to `COMPLETED`
+- In `checkpointer.py`: `promote_step(...)` updates the existing partial row in place instead of inserting a new row
+- In `tools.py` (`execute_write_db()`): retained probe-assisted skip logic for recovery paths
 
 ---
 
