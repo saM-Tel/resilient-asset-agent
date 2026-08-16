@@ -307,15 +307,21 @@ class Checkpointer:
         
         if output_data is not None:
             cursor.execute("""
-                UPDATE steps 
+                UPDATE steps
                 SET status = 'COMPLETED', output_data = ?, completed_at = ?
-                WHERE run_id = ? AND step_name = ? AND status = 'PARTIAL_FAILURE'
+                WHERE id = (
+                    SELECT MAX(id) FROM steps
+                    WHERE run_id = ? AND step_name = ? AND status = 'PARTIAL_FAILURE'
+                )
             """, (json.dumps(output_data, default=str), now, run_id, step_name))
         else:
             cursor.execute("""
-                UPDATE steps 
+                UPDATE steps
                 SET status = 'COMPLETED', completed_at = ?
-                WHERE run_id = ? AND step_name = ? AND status = 'PARTIAL_FAILURE'
+                WHERE id = (
+                    SELECT MAX(id) FROM steps
+                    WHERE run_id = ? AND step_name = ? AND status = 'PARTIAL_FAILURE'
+                )
             """, (now, run_id, step_name))
         
         self.conn.commit()

@@ -130,7 +130,8 @@ FAILURE HANDLING RULES:
 - RECOVERY RULE: When resuming a run with a PARTIAL_FAILURE database write, choose 'verify_db_transaction' with the tx_id from the partial step to probe and confirm the write on the server before proceeding.
 
 RULES:
-- Never repeat completed or partial steps
+- Never repeat completed steps
+- Do NOT retry PARTIAL_FAILURE steps unless explicitly instructed above (e.g., update_cache must be retried until COMPLETED)
 - Return ONLY valid JSON: {"action": "...", "reasoning": "...", "parameters": {...}}
 - Use "DONE" when all steps complete
 - Be brief and respond immediately

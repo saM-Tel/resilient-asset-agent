@@ -303,7 +303,7 @@ def write_db_correction(asset_id: str, correction_data: dict,
 
 
 def verify_db_transaction(tx_id: str) -> bool:
-    """Active verification probe: queries the database to confirm a transaction committed.
+    """Active verification probe: queries the database state/registry to confirm a transaction committed.
 
     Used during recovery from PARTIAL_FAILURE to distinguish between
     UNKNOWN (write may have succeeded) and FAILED (write definitely did not happen).
@@ -314,8 +314,14 @@ def verify_db_transaction(tx_id: str) -> bool:
     Returns:
         True if the transaction appears to have committed, False otherwise
     """
+    registry = _load_state("idempotency_registry", {})
+    # Check if any recorded mutation matches the transaction ID
+    for _, result in registry.items():
+        if isinstance(result, dict) and result.get("tx_id") == tx_id:
+            return True
+
+    # Fallback check against current asset state
     state = _load_state("asset_location", {})
-    # Verify the state holds a valid record matching the transaction
     return bool(state and tx_id)
 
 
