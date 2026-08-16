@@ -303,10 +303,13 @@ def write_db_correction(asset_id: str, correction_data: dict,
 
 
 def verify_db_transaction(tx_id: str) -> bool:
-    """Active verification probe: queries the database state/registry to confirm a transaction committed.
+    """Active verification probe: queries the idempotency registry to confirm a transaction committed.
 
     Used during recovery from PARTIAL_FAILURE to distinguish between
     UNKNOWN (write may have succeeded) and FAILED (write definitely did not happen).
+
+    The idempotency registry is the only durable record of which transactions actually committed,
+    so we return False if the tx_id is not found there — no fallback.
 
     Args:
         tx_id: Transaction ID returned by write_db_correction
@@ -320,9 +323,9 @@ def verify_db_transaction(tx_id: str) -> bool:
         if isinstance(result, dict) and result.get("tx_id") == tx_id:
             return True
 
-    # Fallback check against current asset state
-    state = _load_state("asset_location", {})
-    return bool(state and tx_id)
+    # No fallback — the idempotency registry is the only durable record of committed transactions.
+    # Returning False here prevents incorrectly promoting a PARTIAL_FAILURE step when the write never happened.
+    return False
 
 
 # =============================================================================
