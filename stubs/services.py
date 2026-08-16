@@ -49,8 +49,6 @@ class StaleDataWarning(UserWarning):
 _DEFAULT_STATE = {
     "asset_location": {"lat": 40.7128, "lng": -74.0060, "status": "active", "last_updated": None},
     "expected_state": {"lat": 51.5074, "lng": -0.1278, "status": "synced"},  # Target: London
-    "db_written": False,
-    "cache_updated": False,
     # Idempotency registry (Upgrade 3): maps idempotency_key -> original result.
     # When a mutation is retried with a key we've already seen, we replay the
     # original result instead of re-executing - exactly how real idempotency
@@ -89,8 +87,6 @@ def reset_service_state(checkpointer=None) -> None:
     _DEFAULT_STATE = {
         "asset_location": {"lat": 40.7128, "lng": -74.0060, "status": "active", "last_updated": None},
         "expected_state": {"lat": 51.5074, "lng": -0.1278, "status": "synced"},
-        "db_written": False,
-        "cache_updated": False,
         "idempotency_registry": {},
     }
     
@@ -278,7 +274,6 @@ def write_db_correction(asset_id: str, correction_data: dict,
     
     if config.partial_write:
         # Write succeeds but returns incomplete response (simulates partial write)
-        _save_state("db_written", True)
         result = {
             "tx_id": f"tx_{int(time.time() * 1000)}",
             "status": "partial",  # Incomplete response!
@@ -290,7 +285,6 @@ def write_db_correction(asset_id: str, correction_data: dict,
         return result
     
     # Normal successful write
-    _save_state("db_written", True)
     asset_loc = _load_state("asset_location", {})
     asset_loc["lat"] = correction_data.get("lat")
     asset_loc["lng"] = correction_data.get("lng")
@@ -369,8 +363,6 @@ def update_cache(asset_id: str, cache_data: dict,
         raise CacheSyncFailure("Cache update timed out after 3s")
     
     # Successful cache update
-    _save_state("cache_updated", True)
-    
     result = {
         "status": "SUCCESS",
         "cached_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

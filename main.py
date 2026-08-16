@@ -127,6 +127,11 @@ def main():
         action="store_true",
         help="Simulate partial database write"
     )
+    parser.add_argument(
+        "--clear", "--reset",
+        action="store_true",
+        help="Clear previous data and start fresh if run_id already exists."
+    )
     
     # Connection settings
     parser.add_argument(
@@ -162,7 +167,26 @@ def main():
     # Wire up the checkpointer reference so services can persist state to SQLite
     from stubs.services import set_checkpointer, reset_service_state
     set_checkpointer(checkpointer)
-    reset_service_state(checkpointer)  # Initialize service state in DB
+    
+    # Explicit resume/reset control: the --clear flag decides whether an
+    # existing run_id is wiped and started fresh, or resumed from checkpoint.
+    #
+    # GPS service state (asset_location, expected_state, idempotency registry)
+    # is reset only when starting fresh (new run or --clear). On a plain resume
+    # we preserve it so the mock services continue from where the previous run
+    # left off, matching the checkpointed steps.
+    existing_run = checkpointer.get_run_status(args.run_id)
+    if existing_run:
+        if args.clear:
+            print(f"[INFO] Flag --clear detected: Clearing previous data for run '{args.run_id}'")
+            checkpointer.clear_run(args.run_id)
+            reset_service_state(checkpointer)
+        else:
+            print(f"[INFO] Resuming existing run '{args.run_id}' from checkpoint (Status: {existing_run.get('status')})")
+    else:
+        print(f"[INFO] Creating new run '{args.run_id}'")
+        checkpointer.create_run(args.run_id)
+        reset_service_state(checkpointer)
     
     try:
         # Create and run the agent

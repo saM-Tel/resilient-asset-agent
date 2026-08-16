@@ -284,6 +284,43 @@ class Checkpointer:
         self.conn.commit()
         return cursor.lastrowid
     
+    def promote_step(self, run_id: str, step_name: str, 
+                     output_data: dict = None) -> bool:
+        """
+        Promote an existing PARTIAL_FAILURE step to COMPLETED in place.
+        
+        Used after an active read-verification probe confirms the mutation
+        actually committed server-side. Unlike save_step (which inserts a new
+        row), this UPDATEs the existing row so get_partial_steps() no longer
+        returns it.
+        
+        Args:
+            run_id: Execution run identifier
+            step_name: Name of the step to promote
+            output_data: Optional output data to record (e.g. verified tx_id)
+            
+        Returns:
+            True if a row was updated, False if no PARTIAL_FAILURE row existed
+        """
+        cursor = self.conn.cursor()
+        now = time.time()
+        
+        if output_data is not None:
+            cursor.execute("""
+                UPDATE steps 
+                SET status = 'COMPLETED', output_data = ?, completed_at = ?
+                WHERE run_id = ? AND step_name = ? AND status = 'PARTIAL_FAILURE'
+            """, (json.dumps(output_data, default=str), now, run_id, step_name))
+        else:
+            cursor.execute("""
+                UPDATE steps 
+                SET status = 'COMPLETED', completed_at = ?
+                WHERE run_id = ? AND step_name = ? AND status = 'PARTIAL_FAILURE'
+            """, (now, run_id, step_name))
+        
+        self.conn.commit()
+        return cursor.rowcount > 0
+    
     def get_completed_steps(self, run_id: str) -> list[dict]:
         """Get all successfully completed steps for a run."""
         cursor = self.conn.cursor()

@@ -66,9 +66,11 @@ main.py ──creates──▶ OpenAI client (local LLM)
 | `halt_run(run_id, reason, down_services)` | Sets run status to `HALTED` when services are DOWN — distinct from COMPLETED (all done) or FAILED (unrecoverable). Emits `WORKFLOW_HALTED` audit event with the list of down services. | Agent's health check loop in `run()` |
 | `get_run_status(run_id)` | Returns dict with run status, created/completed timestamps. | Agent's `get_execution_context()` |
 | `save_step(...)` | Persists a step execution (input, output, status, idempotency key). Returns row ID. | All tool wrappers + agent |
+| `promote_step(run_id, step_name, output_data)` | Promotes an existing `PARTIAL_FAILURE` row to `COMPLETED` in place after probe verification. | `runner.execute_action("verify_db_transaction")` |
 | `get_completed_steps(run_id)` | Returns list of completed steps ordered by `step_order`. | Agent's `get_execution_context()`, tools |
 | `get_failed_steps(run_id)` | Returns failed steps **excluding** those later retried successfully. | Agent's `get_execution_context()` |
 | `get_partial_steps(run_id)` | Returns steps with status `PARTIAL_FAILURE` (write committed but response incomplete). | Agent's `get_execution_context()` |
+| `get_step_result(run_id, step_name)` | Returns the latest result for a specific step by name (used by tool wrappers for idempotency checks). | Tool wrappers (`execute_fetch_location`, etc.) |
 | `save_sub_task(...)` | Records a granular sub-task outcome (`SUCCESS`, `FAILED`, `UNKNOWN`). | Tool wrappers for write_db / update_cache |
 | `get_sub_tasks(run_id, step_name)` | Retrieves all sub-tasks for a given step. | — |
 | `emit_event(...)` | Appends an immutable audit event (STEP_STARTED, SUBTASK_COMMITTED, NETWORK_TIMEOUT, etc.). | Tool wrappers |
@@ -101,7 +103,7 @@ main.py ──creates──▶ OpenAI client (local LLM)
 | `build_llm_prompt(context)` | Constructs a system + user message pair for the LLM. Encodes failure-handling rules (health check on failure, halt on DOWN services, skip partial steps). Injects `_force_health_check` flag and previous health results when relevant. | Agent's `run()` loop → calls LLM API |
 | `parse_llm_response(response_content, context)` | Extracts JSON from the LLM response. Handles markdown code blocks, embedded JSON objects, and multiple fallback strategies (context-aware defaults → absolute default of `fetch_location`). | Called after every LLM call in `run()` |
 | `execute_action(action, parameters, reasoning)` | Dispatches to the correct tool wrapper based on the LLM's chosen action. Handles special actions (`DONE`, `halt`/`stop`) and data dependencies between steps. | Tool wrappers + `stubs.services.check_service_health` |
-| `run()` | **The main control loop.** Iterates up to `max_iterations` (default 20): get context → build prompt → call LLM → parse response → execute action → save decision → check completion. Sets `_force_health_check = True` after any failure, forcing a health check on the next iteration. Returns final result dict. | Everything — orchestrates one full agent execution |
+| `run()` | **The main control loop.** Iterates up to `max_iterations` (default 15): get context → build prompt → call LLM → parse response → execute action → save decision → check completion. Sets `_force_health_check = True` after any failure, forcing a health check on the next iteration. Returns final result dict. | Everything — orchestrates one full agent execution |
 
 **The `run()` loop logic:**
 ```
@@ -126,6 +128,7 @@ for each iteration:
 | `validate_consistency` | Reads latest `fetch_location` output → calls `tools.execute_validate_consistency()`. | Requires fetch_location completed |
 | `write_db_correction` | Reads location + validation data. If already synced, marks COMPLETED without calling service. Otherwise builds correction from discrepancies and calls `tools.execute_write_db()`. | Requires fetch_location + validate_consistency |
 | `update_cache` | Reads latest location data (prefers corrected coords if write_db_correction ran). Calls `tools.execute_update_cache()`. | Requires fetch_location |
+| `verify_db_transaction` | Actively probes whether a partial DB transaction committed; on success promotes `write_db_correction` to `COMPLETED`. | `stubs.services.verify_db_transaction()`, `checkpointer.promote_step()` |
 | `check_system_health` | Calls `stubs.services.check_service_health()` → stores results in `_last_health_results` for next iteration. | None |
 | `halt` / `stop` | Marks run as completed (intelligent halt), prints reasoning. | — |
 
@@ -143,18 +146,19 @@ Each wrapper follows the same pattern: **check checkpoint → skip if done → e
 | `execute_fetch_location(cp, run_id, asset_id)` | Fetches asset location with idempotency guard. Skips if step already COMPLETED. | `stubs.services.fetch_asset_location()` | Saves to checkpoint; logs [SKIP]/[EXECUTE]/[OK]/[FAIL] |
 | `execute_validate_consistency(cp, run_id, asset_data)` | Validates data consistency with idempotency guard. | `stubs.services.validate_consistency()` | Compares fetched coords against expected state |
 | `execute_write_db(cp, run_id, correction_data)` | Writes corrections to DB with sub-task tracking + idempotency keys. Handles partial responses and timeouts as `PARTIAL_FAILURE` (UNKNOWN). **Active Read Verification Probe** (Refinement 2): On PARTIAL_FAILURE recovery, calls `verify_db_transaction(tx_id)` to confirm the write actually committed before skipping — emits `[PROBE]` marker and `VERIFICATION_PROBE_SUCCESS` event. | `stubs.services.write_db_correction()` | Generates idempotency key `{run_id}:write_db_correction:database_write`; emits audit events; distinguishes SUCCESS/FAILED/UNKNOWN sub-task outcomes |
-| `execute_update_cache(cp, run_id, cache_data)` | Updates distributed cache with sub-task tracking + idempotency keys. Most failure-prone step. | `stubs.services.update_cache()` | Generates idempotency key `{run_id}:update_cache:cache_invalidation`; handles TimeoutError as UNKNOWN; skips re-execution on PARTIAL_FAILURE to avoid duplicate writes |
+| `execute_update_cache(cp, run_id, cache_data)` | Updates distributed cache with sub-task tracking + idempotency keys. Most failure-prone step. | `stubs.services.update_cache()` | Generates idempotency key `{run_id}:update_cache:cache_invalidation`; handles TimeoutError as UNKNOWN; skips only when `COMPLETED` (re-executes after `PARTIAL_FAILURE` to finish synchronization) |
 
 **Idempotency pattern in write_db / update_cache:**
 ```
-1. Check checkpoint for COMPLETED or PARTIAL_FAILURE → skip if found
-2. Generate idempotency_key = f"{run_id}:{step_name}:{sub_task}"
-3. Emit STEP_STARTED event
-4. Call service with idempotency_key
-5. Service checks its own registry (Upgrade 3) — replays original result if key seen
-6. Save sub-task outcome (SUCCESS/FAILED/UNKNOWN)
-7. Emit appropriate event (SUBTASK_COMMITTED / SUBTASK_FAILED / NETWORK_TIMEOUT)
-8. Save step with status COMPLETED / PARTIAL_FAILURE / FAILED
+1. write_db: skip on COMPLETED or PARTIAL_FAILURE (probe before skip)
+2. update_cache: skip only on COMPLETED
+3. Generate idempotency_key = f"{run_id}:{step_name}:{sub_task}"
+4. Emit STEP_STARTED event
+5. Call service with idempotency_key
+6. Service checks its own registry (Upgrade 3) — replays original result if key seen
+7. Save sub-task outcome (SUCCESS/FAILED/UNKNOWN)
+8. Emit appropriate event (SUBTASK_COMMITTED / SUBTASK_FAILED / NETWORK_TIMEOUT)
+9. Save step with status COMPLETED / PARTIAL_FAILURE / FAILED
 ```
 
 ---
@@ -171,7 +175,7 @@ Each wrapper follows the same pattern: **check checkpoint → skip if done → e
 | `validate_consistency(asset_data, expected_state)` | Compares fetched coords against expected target. Returns `is_synced` boolean + list of discrepancies (lat/lng diffs). | `tools.execute_validate_consistency()` |
 | `write_db_correction(asset_id, correction_data, idempotency_key)` | Writes corrections to DB. Checks idempotency registry first; supports partial write simulation; updates `_DEFAULT_STATE.asset_location`. | `tools.execute_write_db()` |
 | `update_cache(asset_id, cache_data, idempotency_key)` | Updates distributed cache. Most failure-prone — can timeout or be unavailable. Checks idempotency registry. Raises `CacheSyncFailure` (subclass of `TimeoutError`). | `tools.execute_update_cache()` |
-| `verify_db_transaction(tx_id)` | Active verification probe: queries persisted asset state to confirm a transaction committed. Used during PARTIAL_FAILURE recovery to distinguish UNKNOWN from FAILED. Returns True if tx appears committed, False otherwise. | `tools.execute_write_db()` (on retry) |
+| `verify_db_transaction(tx_id)` | Active verification probe: queries persisted asset state to confirm a transaction committed. Used during PARTIAL_FAILURE recovery to distinguish UNKNOWN from FAILED. Returns True if tx appears committed, False otherwise. | `tools.execute_write_db()` and `runner.execute_action("verify_db_transaction")` |
 | `check_service_health()` | Returns a dict like `{"location": True, "database": True, "cache": True}` indicating which services are healthy. | Agent's `execute_action("check_system_health")` |
 
 **Service exceptions:**
@@ -260,7 +264,7 @@ Each wrapper follows the same pattern: **check checkpoint → skip if done → e
 |---|---|---|
 | `COMPLETED` | Step finished successfully | Skip on retry (idempotent) |
 | `FAILED` | Step threw an exception | Agent forces health check, then may retry after all services healthy |
-| `PARTIAL_FAILURE` | Write committed server-side but response incomplete/timeout | **Skip** — do NOT retry (write already happened) |
+| `PARTIAL_FAILURE` | Write may have committed server-side but response incomplete/timeout | `write_db_correction`: probe + promote/skip; `update_cache`: retry until COMPLETED (with health-check gating) |
 | `PENDING` | Not yet executed | Execute normally |
 
 ### Sub-Task Statuses (for write_db / update_cache)
@@ -276,7 +280,7 @@ Each wrapper follows the same pattern: **check checkpoint → skip if done → e
 1. **Any step fails** → Next action MUST be `check_system_health`
 2. **Health check shows a service DOWN** → Action MUST be `halt` (do NOT retry, do NOT call health again)
 3. **All services HEALTHY after failure** → Agent may retry the failed step
-4. **PARTIAL_FAILURE step in context** → Do NOT retry; proceed to next workflow step
+4. **PARTIAL_FAILURE step in context** → Do NOT retry by default, except `update_cache` which must be retried until `COMPLETED`
 
 ---
 
@@ -323,7 +327,8 @@ Status: HALTED | Summary: Workflow halted - services unavailable: cache
 
 **Implementation:**
 - Added `verify_db_transaction(tx_id)` in `stubs/services.py` — queries persisted asset state to confirm a transaction committed
-- In `execute_write_db()` tool wrapper: when encountering an existing `PARTIAL_FAILURE` step on retry, extracts the `tx_id`, calls the verification probe, and if confirmed emits a `VERIFICATION_PROBE_SUCCESS` event with `[PROBE]` terminal marker
+- In `runner.py`, LLM can explicitly choose `verify_db_transaction`; on success, `checkpointer.promote_step(...)` updates `write_db_correction` from `PARTIAL_FAILURE` to `COMPLETED`
+- In `execute_write_db()` tool wrapper, retained probe-assisted skip logic for recovery paths that re-enter the tool wrapper directly
 
 **Terminal output during recovery:**
 ```
@@ -345,7 +350,7 @@ Status: HALTED | Summary: Workflow halted - services unavailable: cache
 ```python
 # In every tool wrapper:
 existing = checkpointer.get_step_result(run_id, step_name)
-if existing and existing["status"] in ("COMPLETED", "PARTIAL_FAILURE"):
+if existing and existing["status"] == "COMPLETED":
     return ToolResult(success=True, data=existing["output_data"])  # [SKIP]
 ```
 

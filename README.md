@@ -145,6 +145,39 @@ python main.py --run-id video-demo --fail-at cache_update
 python main.py --run-id complex-scenario --fail-at cache_update --partial-write
 ```
 
+**All supported scenario switches:**
+- `--fail-at cache_update|location_service`
+- `--inject-stale`
+- `--partial-write`
+
+### Scenario Matrix (Validated)
+
+The agent supports 12 initial-run combinations:
+- `fail_at`: `none`, `cache_update`, `location_service`
+- `inject_stale`: `0|1`
+- `partial_write`: `0|1`
+
+Validated outcomes (initial run with `--clear`):
+
+| fail_at | inject_stale | partial_write | Expected Initial Status | Observed |
+|---|---:|---:|---|---|
+| none | 0 | 0 | COMPLETED | COMPLETED |
+| none | 0 | 1 | COMPLETED | COMPLETED |
+| none | 1 | 0 | COMPLETED | COMPLETED |
+| none | 1 | 1 | COMPLETED | COMPLETED |
+| cache_update | 0 | 0 | HALTED (cache down) | HALTED |
+| cache_update | 0 | 1 | HALTED (cache down) | HALTED |
+| cache_update | 1 | 0 | HALTED (cache down) | HALTED |
+| cache_update | 1 | 1 | HALTED (cache down) | HALTED |
+| location_service | 0 | 0 | HALTED (location service down) | HALTED |
+| location_service | 0 | 1 | HALTED (location service down) | HALTED |
+| location_service | 1 | 0 | HALTED (location service down) | HALTED |
+| location_service | 1 | 1 | HALTED (location service down) | HALTED |
+
+Validated recovery behavior (resume without failure flags):
+- `cache_update` scenarios resume and complete by retrying `update_cache`.
+- `location_service` scenarios resume and complete once location service timeout injection is removed.
+
 ### Debug Visualizer
 
 Monitor agent execution in real-time via web dashboard:
@@ -233,7 +266,9 @@ Instead of the previous misleading `COMPLETED`. This makes it clear in both the 
 
 ### 2. Active Read-Verification Probe on Partial Writes
 
-When `write_db_correction` returns a `PARTIAL_FAILURE`, the agent now calls an active **Verification Probe** (`verify_db_transaction`) to confirm the transaction was actually recorded before proceeding — instead of just assuming it succeeded.
+When `write_db_correction` returns a `PARTIAL_FAILURE`, the agent can invoke an active **Verification Probe** (`verify_db_transaction`) to confirm the transaction was actually recorded before proceeding.
+
+When probe verification succeeds, the step is promoted from `PARTIAL_FAILURE` to `COMPLETED` in SQLite so the agent does not loop on repeated probes.
 
 Terminal output during recovery:
 ```
@@ -249,7 +284,9 @@ Audit trail entry:
 
 **Implementation:**
 - Added `verify_db_transaction(tx_id)` to `stubs/services.py` — queries persisted state to confirm a transaction committed
-- In `execute_write_db()`, when encountering an existing `PARTIAL_FAILURE` step on retry: extracts the `tx_id`, calls the verification probe, emits `VERIFICATION_PROBE_SUCCESS` event if confirmed, and skips re-execution
+- In `runner.py` (`execute_action("verify_db_transaction")`): probe success emits `VERIFICATION_PROBE_SUCCESS` and promotes `write_db_correction` from `PARTIAL_FAILURE` to `COMPLETED`
+- In `checkpointer.py`: `promote_step(...)` updates the existing partial row in place instead of inserting a new row
+- In `tools.py` (`execute_write_db()`): retained probe-assisted skip logic for recovery paths
 
 ---
 

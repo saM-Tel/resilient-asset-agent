@@ -317,13 +317,12 @@ def execute_update_cache(checkpointer: Checkpointer, run_id: str,
     Returns:
         ToolResult with cache update confirmation and sub-task status
     """
-    # Idempotency check - skip if already completed OR partially failed.
-    # A PARTIAL_FAILURE (timeout) means the cache write may have committed
-    # server-side, so re-executing risks a duplicate write.
+    # Idempotency check - ONLY skip if already fully completed.
+    # PARTIAL_FAILURE (timeout) means the cache write outcome is indeterminate,
+    # so we MUST re-execute to ensure the cache is updated.
     existing = checkpointer.get_step_result(run_id, "update_cache")
-    if existing and existing["status"] in ("COMPLETED", "PARTIAL_FAILURE"):
-        status_label = existing["status"]
-        print(f"  [SKIP] update_cache: Already {status_label}, not re-executing (idempotency)")
+    if existing and existing["status"] == "COMPLETED":
+        print(f"  [SKIP] update_cache: Already completed, using cached result")
         return ToolResult(success=True, data=existing.get("output_data"))
     
     # Generate idempotency key for this mutation (Upgrade 3)

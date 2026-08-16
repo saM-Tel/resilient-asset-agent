@@ -114,8 +114,9 @@ class AssetSyncAgent:
 3. write_db_correction - write to database
 4. update_cache - update cache
 
-ADDITIONAL TOOL:
+ADDITIONAL TOOLS:
 - check_system_health - diagnose service status when steps fail
+- verify_db_transaction - actively probe the database to verify if a partial transaction committed (requires tx_id parameter)
 
 FAILURE HANDLING RULES:
 - If ANY step fails, DO NOT retry it immediately. Your next action MUST be check_system_health.
@@ -125,12 +126,17 @@ FAILURE HANDLING RULES:
   - You MUST output action "halt" with reasoning explaining: "[Service] service is reported as DOWN by health check. Pausing workflow until service recovers."
 - Only retry a failed step after health check confirms ALL services are HEALTHY (True).
 - PARTIAL FAILURE RULE: A step listed under "Partial" has ALREADY committed its write server-side (the response was just incomplete). DO NOT retry it - proceed to the NEXT step in the workflow.
+  - EXCEPTION for update_cache: If 'update_cache' failed or timed out, it is NOT completed — you MUST choose action 'update_cache' to finish synchronization. Never output 'DONE' unless 'update_cache' has succeeded (COMPLETED status).
+- RECOVERY RULE: When resuming a run with a PARTIAL_FAILURE database write, choose 'verify_db_transaction' with the tx_id from the partial step to probe and confirm the write on the server before proceeding.
 
 RULES:
 - Never repeat completed or partial steps
 - Return ONLY valid JSON: {"action": "...", "reasoning": "...", "parameters": {...}}
 - Use "DONE" when all steps complete
-- Be brief and respond immediately"""
+- Be brief and respond immediately
+CRITICAL FORMATTING RULES:
+- Keep 'reasoning' concise (1-2 sentences max).
+- Always return a complete, valid JSON object ending with '}'."""
         
         # Build execution history summary (brief format)
         completed_names = [s["step_name"] for s in context["completed_steps"]]
@@ -250,7 +256,17 @@ Decide next action. Return JSON only."""
         parameters = parameters or {}
         
         if action == "DONE":
-            return True, {"message": "All steps completed"}
+            # Safety guard: ensure update_cache is truly completed before exiting
+            completed_steps = self.checkpointer.get_completed_steps(self.run_id)
+            completed_names = {s["step_name"] for s in completed_steps}
+            
+            if "update_cache" not in completed_names:
+                print("  [GUARD] LLM signaled DONE but update_cache is pending. Executing update_cache...")
+                return self.execute_action("update_cache", parameters, reasoning)
+            
+            print("[OK] All steps completed successfully!")
+            self.checkpointer.complete_run(self.run_id)
+            return True, {"status": "completed"}
         
         if action == "fetch_location":
             result = execute_fetch_location(
@@ -343,6 +359,43 @@ Decide next action. Return JSON only."""
             self._last_health_results = health
             return True, {"health_status": health}
         
+        elif action == "verify_db_transaction":
+            # Get tx_id from partial steps or parameters
+            partial_steps = self.checkpointer.get_partial_steps(self.run_id)
+            db_step = next((s for s in partial_steps if s.get("step_name") == "write_db_correction"), None)
+            tx_id = db_step.get("output_data", {}).get("tx_id") if db_step else parameters.get("tx_id")
+            
+            from stubs.services import verify_db_transaction
+            is_valid = verify_db_transaction(tx_id) if tx_id else False
+            
+            if is_valid:
+                print(f"  [PROBE] verify_db_transaction: Active probe confirmed tx {tx_id} exists on database.")
+                
+                # Promote the step from PARTIAL_FAILURE to COMPLETED in place —
+                # the transaction is verified on the server, so it's no longer
+                # ambiguous. This prevents the LLM from looping on repeated
+                # probes in subsequent iterations.
+                if db_step:
+                    promoted = self.checkpointer.promote_step(
+                        run_id=self.run_id,
+                        step_name="write_db_correction",
+                        output_data={"tx_id": tx_id, "status": "completed", "verified_by_probe": True}
+                    )
+                    if promoted:
+                        print(f"  [PROMOTE] write_db_correction: PARTIAL_FAILURE -> COMPLETED (probe-verified)")
+                
+                self.checkpointer.emit_event(
+                    run_id=self.run_id,
+                    event="VERIFICATION_PROBE_SUCCESS",
+                    sub_task="database_write",
+                    tx_id=tx_id,
+                    details={"message": "LLM-invoked probe confirmed transaction on server"}
+                )
+                return True, {"verified": True, "tx_id": tx_id}
+            else:
+                print(f"  [FAIL] verify_db_transaction: tx {tx_id} not found on database.")
+                return False, {"verified": False}
+        
         elif action in ["halt", "stop"]:
             # Agent has decided to halt due to service unavailability
             print(f"[INFO] Workflow halted by agent: {reasoning}")
@@ -368,15 +421,9 @@ Decide next action. Return JSON only."""
         print(f"Starting Asset Sync Agent - Run ID: {self.run_id}")
         print(f"{'='*60}\n")
         
-        # Ensure run record exists in the runs table (create it if missing)
-        existing_run = self.checkpointer.get_run_status(self.run_id)
-        if not existing_run:
-            print(f"[INFO] Creating new run '{self.run_id}'")
-            self.checkpointer.create_run(self.run_id)
-        elif existing_run["status"] != "IN_PROGRESS":
-            # Re-running a completed/failed run - clear previous data for clean slate
-            print(f"[INFO] Re-running with existing ID '{self.run_id}' - clearing previous data")
-            self.checkpointer.clear_run(self.run_id)
+        # Run initialization (create / resume / clear) is handled explicitly by
+        # main.py via the --clear flag, so the run record is guaranteed to exist
+        # before the control loop starts. We no longer auto-clear here.
         
         # Emit run-started event to the audit trail (Upgrade 2)
         self.checkpointer.emit_event(
@@ -391,32 +438,31 @@ Decide next action. Return JSON only."""
             # Get current state
             context = self.get_execution_context()
             
-            # Check if all required steps are completed - auto-complete if so.
-            # A step in PARTIAL_FAILURE counts as "done" for progression: the
-            # mutation likely committed server-side, so re-executing would be a
-            # duplicate write. We proceed to the next step instead.
+            # Check if the workflow is genuinely completed - auto-complete if so.
             #
-            # IMPORTANT: We only auto-complete when NO failure is pending
-            # reconciliation. If a step just failed (e.g. cache timeout ->
-            # UNKNOWN), we must run the health check / halt logic first rather
-            # than declaring success over an indeterminate state.
+            # IMPORTANT: A step in PARTIAL_FAILURE counts as "done" for
+            # progression (the mutation likely committed server-side, so
+            # re-executing would be a duplicate write) - EXCEPT for update_cache.
+            # The cache is the final step and its PARTIAL_FAILURE (timeout) means
+            # the outcome is indeterminate, so the workflow is NOT truly finished
+            # until update_cache is fully COMPLETED. This prevents the agent from
+            # exiting on a resumed run where a stale PARTIAL_FAILURE update_cache
+            # from a previous timeout would otherwise be mistaken for "done".
             #
-            # NOTE ON WHEN THIS FIRES: In this example project, clear_run() wipes
-            # all steps at the start of a re-run (main.py line ~170), so
-            # auto-complete never actually triggers - there's nothing to complete
-            # against on restart. It IS useful in real-world scenarios where state
-            # persists across process crashes or long-running agents: if all 4
-            # steps finish naturally within a single run, the loop would otherwise
-            # still ask the LLM one more time (iteration N+1) before exiting when
-            # the LLM returns "DONE". Auto-complete avoids that extra LLM call by
-            # detecting completion at the top of the next iteration instead.
+            # We only auto-complete when NO failure is pending reconciliation
+            # (guarded by _force_health_check below).
             if not self._force_health_check:
-                completed_step_names = set(s["step_name"] for s in context["completed_steps"])
-                partial_step_names = set(s["step_name"] for s in context["partial_steps"])
-                done_step_names = completed_step_names | partial_step_names
-                required_steps = {"fetch_location", "validate_consistency", "write_db_correction", "update_cache"}
-                
-                if required_steps.issubset(done_step_names):
+                completed_names = {s["step_name"] for s in context["completed_steps"]}
+                partial_names = {s["step_name"] for s in context["partial_steps"]}
+
+                # update_cache MUST be COMPLETED (cannot be partial/failed)
+                cache_done = "update_cache" in completed_names
+                # write_db_correction may be COMPLETED or PARTIAL_FAILURE (committed)
+                db_done = "write_db_correction" in completed_names or "write_db_correction" in partial_names
+                fetch_done = "fetch_location" in completed_names
+                validate_done = "validate_consistency" in completed_names
+
+                if fetch_done and validate_done and db_done and cache_done:
                     print("[OK] All required steps completed! Auto-completing workflow.")
                     self.checkpointer.emit_event(
                         self.run_id, "RUN_COMPLETED",
@@ -492,8 +538,8 @@ Decide next action. Return JSON only."""
                     model="qwen3.6-35b-thinking-off",
                     messages=messages,
                     temperature=0.1,
-                    max_tokens=200,  # Shorter responses minimize thinking mode
-                    timeout=10  # Prevent hangs from extended thinking
+                    max_tokens=600,  # Shorter responses minimize thinking mode
+                    timeout=30  # Prevent hangs from extended thinking
                 )
                 
                 response_content = response.choices[0].message.content.strip()
@@ -520,6 +566,17 @@ Decide next action. Return JSON only."""
                 
                 # Parse decision - pass context so fallback can pick a better default
                 decision = self.parse_llm_response(response_content, context)
+                
+                # Guard against premature DONE: if LLM signals DONE but update_cache
+                # has not reached COMPLETED status, force it to execute update_cache instead.
+                if decision.get("action") == "DONE":
+                    completed_steps = self.checkpointer.get_completed_steps(self.run_id)
+                    completed_names = {s["step_name"] for s in completed_steps if s.get("status") == "COMPLETED"}
+                    
+                    if "update_cache" not in completed_names:
+                        print("  [GUARD] LLM signaled DONE but update_cache is not COMPLETED. Forcing update_cache...")
+                        decision = {"action": "update_cache", "reasoning": "Guard intercepted premature DONE", "parameters": {}}
+                
                 action = decision.get("action", "UNKNOWN")
                 reasoning = decision.get("reasoning", "")
                 parameters = decision.get("parameters", {})
