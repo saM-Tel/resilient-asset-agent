@@ -146,14 +146,14 @@ python main.py --run-id complex-scenario --fail-at cache_update --partial-write
 ```
 
 **All supported scenario switches:**
-- `--fail-at cache_update|location_service`
+- `--fail-at cache_update|location_service|location_unavailable|cache_unavailable`
 - `--inject-stale`
 - `--partial-write`
 
 ### Scenario Matrix (Validated)
 
-The agent supports 12 initial-run combinations:
-- `fail_at`: `none`, `cache_update`, `location_service`
+The agent supports 20 initial-run combinations:
+- `fail_at`: `none`, `cache_update`, `location_service`, `location_unavailable`, `cache_unavailable`
 - `inject_stale`: `0|1`
 - `partial_write`: `0|1`
 
@@ -173,10 +173,20 @@ Validated outcomes (initial run with `--clear`):
 | location_service | 0 | 1 | HALTED (location service down) | HALTED |
 | location_service | 1 | 0 | HALTED (location service down) | HALTED |
 | location_service | 1 | 1 | HALTED (location service down) | HALTED |
+| location_unavailable | 0 | 0 | HALTED (location service down) | HALTED |
+| location_unavailable | 0 | 1 | HALTED (location service down) | HALTED |
+| location_unavailable | 1 | 0 | HALTED (location service down) | HALTED |
+| location_unavailable | 1 | 1 | HALTED (location service down) | HALTED |
+| cache_unavailable | 0 | 0 | HALTED (cache down) | HALTED |
+| cache_unavailable | 0 | 1 | HALTED (cache down) | HALTED |
+| cache_unavailable | 1 | 0 | HALTED (cache down) | HALTED |
+| cache_unavailable | 1 | 1 | HALTED (cache down) | HALTED |
 
 Validated recovery behavior (resume without failure flags):
 - `cache_update` scenarios resume and complete by retrying `update_cache`.
+- `cache_unavailable` scenarios resume and complete once cache unavailability injection is removed.
 - `location_service` scenarios resume and complete once location service timeout injection is removed.
+- `location_unavailable` scenarios resume and complete once location service unavailability injection is removed.
 
 ### Debug Visualizer
 

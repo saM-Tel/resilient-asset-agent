@@ -412,15 +412,43 @@ python main.py --run-id test-001
 # Cache timeout after DB write succeeds
 python main.py --run-id test-002 --fail-at cache_update
 
+# Cache service unavailable
+python main.py --run-id test-003 --fail-at cache_unavailable
+
+# Location service timeout
+python main.py --run-id test-004 --fail-at location_service
+
+# Location service unavailable
+python main.py --run-id test-005 --fail-at location_unavailable
+
 # Stale location data injection
-python main.py --run-id test-003 --inject-stale
+python main.py --run-id test-006 --inject-stale
 
 # Partial database write simulation
-python main.py --run-id test-004 --partial-write
+python main.py --run-id test-007 --partial-write
 
 # Custom LLM server URL
-python main.py --run-id test-005 --llm-url http://localhost:8080/v1
+python main.py --run-id test-008 --llm-url http://localhost:8080/v1
 ```
+
+### Validated Scenario Matrix
+
+CLI-exposed matrix dimensions:
+- `--fail-at`: `none`, `cache_update`, `cache_unavailable`, `location_service`, `location_unavailable`
+- `--inject-stale`: `0|1`
+- `--partial-write`: `0|1`
+
+Total initial-run combinations: $5 \times 2 \times 2 = 20$.
+
+Observed initial outcomes:
+- `fail_at=none` combinations: `COMPLETED`
+- `fail_at=cache_update` combinations: `HALTED`
+- `fail_at=cache_unavailable` combinations: `HALTED`
+- `fail_at=location_service` combinations: `HALTED`
+- `fail_at=location_unavailable` combinations: `HALTED`
+
+Observed resume outcomes (same `run_id`, no failure flags):
+- All halted combinations resumed to `COMPLETED`.
 
 ---
 

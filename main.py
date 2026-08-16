@@ -53,6 +53,14 @@ def configure_failure_injection(args: argparse.Namespace) -> None:
     elif args.fail_at == "location_service":
         ServiceConfig.inject_timeout = True
         print("[WARN] FAILURE INJECTION: Location service will timeout")
+
+    elif args.fail_at == "location_unavailable":
+        ServiceConfig.inject_unavailable = True
+        print("[WARN] FAILURE INJECTION: Location service will be unavailable")
+
+    elif args.fail_at == "cache_unavailable":
+        ServiceConfig.cache_unavailable = True
+        print("[WARN] FAILURE INJECTION: Cache service will be unavailable")
     
     if args.inject_stale:
         ServiceConfig.inject_stale_data = True
@@ -113,7 +121,7 @@ def main():
     parser.add_argument(
         "--fail-at",
         type=str,
-        choices=["cache_update", "location_service"],
+        choices=["cache_update", "location_service", "location_unavailable", "cache_unavailable"],
         default=None,
         help="Inject failure at specific step (simulates real-world failures)"
     )
